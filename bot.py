@@ -35,8 +35,7 @@ threading.Thread(target=run_flask).start()
 @tree.command(name="join", description="Haz que el bot entre a un canal de voz")
 @app_commands.describe(channel_id="ID del canal de voz (opcional)")
 async def join(interaction: discord.Interaction, channel_id: str = None):
-
-    await interaction.response.defer()  # 👈 sin ephemeral
+    await interaction.response.defer()  # ✅ sin ephemeral
 
     voice_channel = None
 
@@ -49,19 +48,27 @@ async def join(interaction: discord.Interaction, channel_id: str = None):
         await interaction.followup.send("❌ No se encontró ningún canal de voz.")
         return
 
-    await voice_channel.connect()
-    await interaction.followup.send(f"✅ Conectado a **{voice_channel.name}**")
+    try:
+        await voice_channel.connect()
+        await interaction.followup.send(f"✅ Conectado a **{voice_channel.name}**")
+    except Exception as e:
+        await interaction.followup.send(f"⚠️ Error al conectar: `{e}`")
 
 
 @tree.command(name="leave", description="Haz que el bot salga del canal de voz")
-        async def leave(interaction: discord.Interaction):
-            await interaction.response.defer()
-        
-            if interaction.guild.voice_client:
-                await interaction.guild.voice_client.disconnect()
-                await interaction.followup.send("👋 Desconectado del canal.")
-            else:
-                await interaction.followup.send("❌ No estoy en ningún canal.")
+async def leave(interaction: discord.Interaction):
+    await interaction.response.defer()
+
+    vc = interaction.guild.voice_client
+    if vc and vc.is_connected():
+        try:
+            await vc.disconnect()
+            await interaction.followup.send("👋 Desconectado del canal.")
+        except Exception as e:
+            await interaction.followup.send(f"⚠️ Error al salir: `{e}`")
+    else:
+        await interaction.followup.send("❌ No estoy en ningún canal.")
+
 
 
 @bot.event
