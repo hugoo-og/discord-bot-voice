@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: discord-bot
+    env: python3
+    plan: free
+    buildCommand: |
+      apt-get update && \
+      apt-get install -y gcc libffi-dev libsodium-dev && \
+      pip install -r requirements.txt
+    startCommand: python3 bot.py
