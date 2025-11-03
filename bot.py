@@ -6,6 +6,8 @@ from flask import Flask
 import threading
 from gtts import gTTS
 import asyncio
+import requests
+import time
 
 # === Discord setup ===
 intents = discord.Intents.default()
@@ -30,7 +32,20 @@ def status():
 def run_flask():
     app.run(host="0.0.0.0", port=8080)
 
-threading.Thread(target=run_flask).start()
+def keep_alive():
+    def ping():
+        while True:
+            try:
+                requests.get("https://discord-bot-voice-cbpv.onrender.com")
+            except:
+                pass
+            time.sleep(300)  # cada 5 minutos
+
+    thread = threading.Thread(target=ping)
+    thread.daemon = True
+    thread.start()
+
+
 
 
 # === Slash commands ===
@@ -119,4 +134,14 @@ async def on_ready():
     print(f"Bot conectado como {bot.user}.")
 
 
+threading.Thread(target=run_flask).start()
+keep_alive()
 bot.run(os.getenv("DISCORD_TOKEN"))
+
+
+
+
+
+
+
+
