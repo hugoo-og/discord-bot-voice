@@ -1,0 +1,13 @@
+name: Keepalive Bot Healthcheck
+
+on:
+  schedule:
+    - cron: "*/50 * * * *"  # cada 50 minutos
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Healthcheck Ping
+        run: curl -s https://TU-BOT.onrender.com/status
