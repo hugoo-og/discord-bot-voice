@@ -35,7 +35,9 @@ threading.Thread(target=run_flask).start()
 @tree.command(name="join", description="Haz que el bot entre a un canal de voz")
 @app_commands.describe(channel_id="ID del canal de voz (opcional)")
 async def join(interaction: discord.Interaction, channel_id: str = None):
-    await interaction.response.defer(ephemeral=True)
+
+    await interaction.response.defer()  # 👈 sin ephemeral
+
     voice_channel = None
 
     if channel_id:
@@ -52,13 +54,14 @@ async def join(interaction: discord.Interaction, channel_id: str = None):
 
 
 @tree.command(name="leave", description="Haz que el bot salga del canal de voz")
-async def leave(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    if interaction.guild.voice_client:
-        await interaction.guild.voice_client.disconnect()
-        await interaction.followup.send("👋 Desconectado del canal.")
-    else:
-        await interaction.followup.send("❌ No estoy en ningún canal.")
+        async def leave(interaction: discord.Interaction):
+            await interaction.response.defer()
+        
+            if interaction.guild.voice_client:
+                await interaction.guild.voice_client.disconnect()
+                await interaction.followup.send("👋 Desconectado del canal.")
+            else:
+                await interaction.followup.send("❌ No estoy en ningún canal.")
 
 
 @bot.event
