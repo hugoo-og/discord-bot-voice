@@ -4,6 +4,8 @@ from discord import app_commands
 from discord.ext import commands
 from flask import Flask
 import threading
+from gtts import gTTS
+import asyncio
 
 # === Discord setup ===
 intents = discord.Intents.default()
@@ -32,27 +34,33 @@ threading.Thread(target=run_flask).start()
 
 
 # === Slash commands ===
-@tree.command(name="join", description="Haz que el bot entre a un canal de voz")
-@app_commands.describe(channel_id="ID del canal de voz (opcional)")
-async def join(interaction: discord.Interaction, channel_id: str = None):
-    await interaction.response.defer()  # ✅ sin ephemeral
+@tree.command(name="join", description="El bot entra al canal de voz")
+@app_commands.describe(channel_id="ID del canal de voz")
+async def join(interaction: discord.Interaction, channel_id: str):
 
-    voice_channel = None
+    await interaction.response.send_message("✅ Uniéndome al canal...", ephemeral=True)
 
-    if channel_id:
-        voice_channel = interaction.guild.get_channel(int(channel_id))
-    elif interaction.user.voice:
-        voice_channel = interaction.user.voice.channel
-
-    if not voice_channel:
-        await interaction.followup.send("❌ No se encontró ningún canal de voz.")
+    channel = interaction.guild.get_channel(int(channel_id))
+    if not channel or channel.type != discord.ChannelType.voice:
+        await interaction.followup.send("❌ Ese canal no es válido", ephemeral=True)
         return
 
-    try:
-        await voice_channel.connect()
-        await interaction.followup.send(f"✅ Conectado a **{voice_channel.name}**")
-    except Exception as e:
-        await interaction.followup.send(f"⚠️ Error al conectar: `{e}`")
+    voice_client = interaction.guild.voice_client
+
+    if voice_client and voice_client.is_connected():
+        await voice_client.move_to(channel)
+    else:
+        voice_client = await channel.connect()
+
+    # Reproducir silencio en loop
+    silence = discord.FFmpegPCMAudio("silence.mp3")
+    voice_client.play(silence, after=lambda e: restart_silence(voice_client))
+
+def restart_silence(vc: discord.VoiceClient):
+    if not vc.is_playing():
+        silence = discord.FFmpegPCMAudio("silence.mp3")
+        vc.play(silence, after=lambda e: restart_silence(vc))
+
 
 
 @tree.command(name="leave", description="Haz que el bot salga del canal de voz")
@@ -68,6 +76,40 @@ async def leave(interaction: discord.Interaction):
             await interaction.followup.send(f"⚠️ Error al salir: `{e}`")
     else:
         await interaction.followup.send("❌ No estoy en ningún canal.")
+
+
+@tree.command(name="say", description="El bot habla en el canal de voz")
+@app_commands.describe(texto="Lo que quieres que diga el bot")
+async def say(interaction: discord.Interaction, texto: str):
+
+    vc = interaction.guild.voice_client
+    if not vc:
+        await interaction.response.send_message("❌ El bot no está en un canal de voz", ephemeral=True)
+        return
+
+    await interaction.response.send_message(f"📢 Hablando...", ephemeral=True)
+
+    # Parar silencio
+    if vc.is_playing():
+        vc.stop()
+
+    # Crear audio
+    filename = "tts.mp3"
+    tts = gTTS(text=texto, lang="es")
+    tts.save(filename)
+
+    # Reproducir voz
+    vc.play(discord.FFmpegPCMAudio(filename))
+
+    # Esperar a que termine
+    while vc.is_playing():
+        await asyncio.sleep(0.5)
+
+    os.remove(filename)
+
+    # Reanudar silencio infinito
+    silence = discord.FFmpegPCMAudio("silence.mp3")
+    vc.play(silence, after=lambda e: restart_silence(vc))
 
 
 
