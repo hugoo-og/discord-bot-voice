@@ -5,6 +5,7 @@ import tempfile
 import asyncio
 import time
 from typing import Optional
+import threading
 
 import discord
 from discord import app_commands
