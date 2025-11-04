@@ -52,18 +52,9 @@ tts_lock = asyncio.Lock()  # evita solapamiento de /say
 def play_audio(vc: discord.VoiceClient, source_path: str, after=None):
     """
     Reproduce un archivo con FFmpegPCMAudio en el VoiceClient.
-    Si ya está reproduciendo, lo para antes y espera un momento.
+    No hace sleeps bloqueantes; el control de esperar se hace desde async.
     """
     try:
-        if vc.is_playing():
-            try:
-                vc.stop()
-            except Exception:
-                pass
-            # dejar que ffmpeg muera un momento
-            import time as _t
-            _t.sleep(0.1)
-
         player = discord.FFmpegPCMAudio(source_path)
         vc.play(player, after=after)
     except Exception as e:
@@ -170,64 +161,108 @@ async def leave(interaction: discord.Interaction):
 @tree.command(name="say", description="El bot dice el texto en el canal de voz (voz masculina española)")
 @app_commands.describe(texto="Texto a decir")
 async def say(interaction: discord.Interaction, texto: str):
+    # RESPONDEMOS RÁPIDO para evitar timeouts y usar followup luego
     await interaction.response.defer(ephemeral=True)
 
     if len(texto) > 300:
         await interaction.followup.send("❌ Texto demasiado largo (máx 300).", ephemeral=True)
         return
 
+    # obtenemos o intentamos unirnos al canal del usuario
     vc = interaction.guild.voice_client
     if not vc or not vc.is_connected():
         if interaction.user.voice and interaction.user.voice.channel:
             try:
                 vc = await interaction.user.voice.channel.connect()
-            except:
+            except Exception as e:
+                logging.exception("No puedo unirme al canal")
                 await interaction.followup.send("❌ No puedo unirme a tu canal.", ephemeral=True)
                 return
         else:
             await interaction.followup.send("❌ Debes estar en un canal de voz.", ephemeral=True)
             return
 
-    await interaction.followup.send("🔊 Generando voz masculina...", ephemeral=True)
+    # Mensaje intermedio
+    try:
+        await interaction.followup.send("🔊 Generando voz masculina...", ephemeral=True)
+    except discord.HTTPException:
+        # Si esto fallase por cualquier motivo, lo ignoramos pero seguimos (no queremos crashear)
+        logging.warning("followup.send falló: Interaction probablemente expiró, seguimos de todas formas.")
 
     async with tts_lock:
+        # generar TTS con Coqui (wav)
         try:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
                 tmp_path = tmp.name
 
-            # Voz masculina en español
+            # Generación: usa el modelo ya cargado en tts_model
             tts_model.tts_to_file(
                 text=texto,
                 file_path=tmp_path,
-                speaker=0
+                speaker=0  # cambiar si quieres otro speaker
             )
         except Exception as e:
-            logging.exception("Error TTS")
-            await interaction.followup.send(f"⚠️ Error TTS: `{e}`", ephemeral=True)
+            logging.exception("Error generando TTS")
+            await interaction.followup.send(f"⚠️ Error generando TTS: `{e}`", ephemeral=True)
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except:
+                pass
             return
 
+        # Si está reproduciendo algo, lo paramos y esperamos un pelín (no bloqueante)
+        try:
+            if vc.is_playing():
+                vc.stop()
+                await asyncio.sleep(0.15)  # pequeña espera asíncrona para que ffmpeg cierre procesos
+        except Exception:
+            logging.exception("Error al parar reproducción previa")
+
+        # Creamos evento que señalaremos desde el callback del hilo de audio
         finished = asyncio.Event()
 
-        def after_playing(_):
-            bot.loop.call_soon_threadsafe(finished.set)
+        def after_playing(error):
+            if error:
+                logging.exception("Error en playback after: %s", error)
+            # señalamos en el event loop principal del bot que ha terminado
+            try:
+                bot.loop.call_soon_threadsafe(finished.set)
+            except Exception:
+                logging.exception("No se pudo señalizar finished desde after_playing")
 
-        if vc.is_playing():
-            vc.stop()
-
+        # Reproducir
         try:
             play_audio(vc, tmp_path, after=after_playing)
-        except Exception as e:
-            logging.exception("Error al reproducir")
-            await interaction.followup.send("⚠️ Error al reproducir.", ephemeral=True)
+        except Exception:
+            logging.exception("Error iniciando reproducción")
+            await interaction.followup.send("⚠️ Error al reproducir el audio.", ephemeral=True)
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except:
+                pass
             return
 
-        await finished.wait()
+        # esperamos a que termine (no bloqueante)
+        try:
+            await finished.wait()
+        except Exception:
+            logging.exception("Error esperando finished")
 
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        # limpiar
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            logging.exception("No se pudo borrar tmp TTS")
 
-        await interaction.followup.send("✅ He terminado de hablar.", ephemeral=True)
-
+        # respuesta final (seguimos con followup)
+        try:
+            await interaction.followup.send("✅ He terminado de hablar.", ephemeral=True)
+        except discord.HTTPException:
+            # interacción pudo expirar, lo ignoramos
+            logging.warning("No se pudo enviar followup final: Interaction expiró")
 
 
 
