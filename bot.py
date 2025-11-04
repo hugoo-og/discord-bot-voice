@@ -4,12 +4,12 @@ from discord import app_commands
 from discord.ext import commands
 from flask import Flask, jsonify
 import threading
-from gtts import gTTS
-import asyncio
-import tempfile
 import logging
 import requests
 import time
+from TTS.api import TTS
+import tempfile
+import asyncio
 
 logging.basicConfig(level=logging.INFO)
 
@@ -20,6 +20,8 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 intents = discord.Intents.default()
 intents.voice_states = True
 intents.guilds = True
+# cargamos modelo solo una vez
+tts_model = TTS("tts_models/es/css10/vits")
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree  # slash commands
@@ -165,48 +167,48 @@ async def leave(interaction: discord.Interaction):
         await interaction.followup.send(f"⚠️ Error al desconectar: `{e}`", ephemeral=True)
 
 
-@tree.command(name="say", description="El bot dice el texto en el canal de voz")
-@app_commands.describe(texto="Texto a decir (máx 200 caracteres recomendado)")
+@tree.command(name="say", description="El bot dice el texto en el canal de voz (voz masculina española)")
+@app_commands.describe(texto="Texto a decir")
 async def say(interaction: discord.Interaction, texto: str):
     await interaction.response.defer(ephemeral=True)
 
-    if len(texto) > 1000:
-        await interaction.followup.send("❌ Texto demasiado largo.", ephemeral=True)
+    if len(texto) > 300:
+        await interaction.followup.send("❌ Texto demasiado largo (máx 300).", ephemeral=True)
         return
 
-    # Asegurar conexión a canal
     vc = interaction.guild.voice_client
     if not vc or not vc.is_connected():
         if interaction.user.voice and interaction.user.voice.channel:
             try:
                 vc = await interaction.user.voice.channel.connect()
             except:
-                await interaction.followup.send("❌ No puedo unirme al canal.", ephemeral=True)
+                await interaction.followup.send("❌ No puedo unirme a tu canal.", ephemeral=True)
                 return
         else:
-            await interaction.followup.send("❌ No estás en un canal de voz.", ephemeral=True)
+            await interaction.followup.send("❌ Debes estar en un canal de voz.", ephemeral=True)
             return
 
-    await interaction.followup.send("📢 Generando audio...", ephemeral=True)
+    await interaction.followup.send("🔊 Generando voz masculina española...", ephemeral=True)
 
     async with tts_lock:
-        # crear TTS temporal
         try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
+            # archivo temporal
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
                 tmp_path = tmp.name
-            tts = gTTS(text=texto, lang="es")
-            tts.save(tmp_path)
+
+            # Generación TTS
+            tts_model.tts_to_file(
+                text=texto,
+                file_path=tmp_path,
+                speaker=0  # voz masculina (puedes cambiar luego)
+            )
         except Exception as e:
-            logging.exception("Error al generar TTS")
+            logging.exception("Error TTS")
             await interaction.followup.send(f"⚠️ Error TTS: `{e}`", ephemeral=True)
             return
 
-        # stop previo si hay
-        try:
-            if vc.is_playing():
-                vc.stop()
-        except:
-            pass
+        if vc.is_playing():
+            vc.stop()
 
         finished = asyncio.Event()
 
@@ -223,11 +225,11 @@ async def say(interaction: discord.Interaction, texto: str):
 
         await finished.wait()
 
-        # borrar temporal
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
 
         await interaction.followup.send("✅ He terminado de hablar.", ephemeral=True)
+
 
 
 @bot.event
