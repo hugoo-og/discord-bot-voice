@@ -1,6 +1,4 @@
 discord.py
-gTTS
-PyNaCl
 Flask
 requests
 TTS==0.22.0
