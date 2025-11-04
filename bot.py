@@ -24,6 +24,9 @@ intents.guilds = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree  # slash commands
 
+# Guarda el último canal de voz por guild para posibles reconexiones
+guild_last_voice_channel: dict[int, int] = {}
+
 # === Minimal Flask (health endpoints only) ===
 app = Flask(__name__)
 
@@ -47,59 +50,124 @@ tts_lock = asyncio.Lock()  # evita solapamiento de /say
 def play_audio(vc: discord.VoiceClient, source_path: str, after=None):
     """
     Reproduce un archivo con FFmpegPCMAudio en el VoiceClient.
-    Usa vc.play(...) y maneja el callback after si se desea.
+    Si ya está reproduciendo, lo para antes y espera un momento.
     """
     try:
+        if vc.is_playing():
+            try:
+                vc.stop()
+            except Exception:
+                pass
+            # dejar que ffmpeg muera un momento
+            import time as _t
+            _t.sleep(0.1)
+
         player = discord.FFmpegPCMAudio(source_path)
         vc.play(player, after=after)
     except Exception as e:
         logging.exception("Error al reproducir audio: %s", e)
+        raise
+
+
 
 # === Slash commands ===
 
 @tree.command(name="join", description="Haz que el bot entre a un canal de voz (opcional: canal ID)")
 @app_commands.describe(channel_id="ID del canal de voz (opcional)")
-async def join(interaction: discord.Interaction, channel_id: str = None):
-    await interaction.response.defer(ephemeral=True)
+async def join(interaction: discord.Interaction, channel_id: str | None = None):
+    # respondemos rápido para evitar timeout de la interacción
+    await interaction.response.send_message("🔄 Intentando conectarme... (operación en background)", ephemeral=True)
+
+    # calculamos channel_id numérico
+    target_channel_id = None
     try:
         if channel_id:
-            channel = interaction.guild.get_channel(int(channel_id))
+            target_channel_id = int(channel_id)
         else:
-            channel = interaction.user.voice.channel if interaction.user.voice else None
+            if interaction.user.voice and interaction.user.voice.channel:
+                target_channel_id = interaction.user.voice.channel.id
+    except Exception:
+        target_channel_id = None
 
+    if not target_channel_id:
+        await interaction.followup.send("❌ No se ha encontrado canal de voz para unirme.", ephemeral=True)
+        return
+
+    # lanzamos tarea background que avisará por el canal del comando
+    notify_channel_id = interaction.channel.id if interaction.channel else None
+    bot.loop.create_task(_do_connect(interaction.guild.id, target_channel_id, notify_channel_id))
+
+
+async def _do_connect(guild_id: int, channel_id: int, notify_channel_id: int | None):
+    """
+    Tarea en background para conectar al canal de voz y notificar.
+    """
+    try:
+        guild = bot.get_guild(guild_id)
+        if not guild:
+            logging.warning("Guild not found for id %s", guild_id)
+            return
+        channel = guild.get_channel(channel_id)
         if not channel or channel.type != discord.ChannelType.voice:
-            await interaction.followup.send("❌ Canal de voz no válido.", ephemeral=True)
+            if notify_channel_id:
+                ch = guild.get_channel(notify_channel_id)
+                if ch:
+                    await ch.send("❌ Canal de voz inválido (background).")
             return
 
-        vc = interaction.guild.voice_client
+        vc = guild.voice_client
         if vc and vc.is_connected():
             await vc.move_to(channel)
-            await interaction.followup.send(f"🔁 Movido a **{channel.name}**.", ephemeral=True)
+            if notify_channel_id:
+                ch = guild.get_channel(notify_channel_id)
+                if ch:
+                    await ch.send(f"🔁 Movido a **{channel.name}** (background).")
         else:
-            await channel.connect()
-            await interaction.followup.send(f"✅ Conectado a **{channel.name}**.", ephemeral=True)
+            await channel.connect(reconnect=True)
+            guild_last_voice_channel[guild_id] = channel_id
+            if notify_channel_id:
+                ch = guild.get_channel(notify_channel_id)
+                if ch:
+                    await ch.send(f"✅ Conectado a **{channel.name}** (background).")
     except Exception as e:
-        logging.exception("Error en /join")
-        await interaction.followup.send(f"⚠️ Error al unir: `{e}`", ephemeral=True)
+        logging.exception("Error en background connect")
+        try:
+            if notify_channel_id:
+                guild = bot.get_guild(guild_id)
+                if guild:
+                    ch = guild.get_channel(notify_channel_id)
+                    if ch:
+                        await ch.send(f"⚠️ Error en conexión (background): `{e}`")
+        except Exception:
+            pass
+
 
 @tree.command(name="leave", description="Haz que el bot salga del canal de voz")
 async def leave(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.send_message("🔄 Desconectando (background)...", ephemeral=True)
     try:
         vc = interaction.guild.voice_client
         if vc and vc.is_connected():
-            await vc.disconnect()
-            await interaction.followup.send("👋 Desconectado.", ephemeral=True)
+            # desconecta en background para no bloquear interacción
+            async def _do_leave():
+                try:
+                    await vc.disconnect()
+                except Exception:
+                    logging.exception("Error al desconectar background")
+            bot.loop.create_task(_do_leave())
+            # limpiar último canal conocido
+            guild_last_voice_channel.pop(interaction.guild.id, None)
+            await interaction.followup.send("👋 He pedido desconectar.", ephemeral=True)
         else:
             await interaction.followup.send("❌ No estoy en ningún canal.", ephemeral=True)
     except Exception as e:
         logging.exception("Error en /leave")
-        await interaction.followup.send(f"⚠️ Error al salir: `{e}`", ephemeral=True)
+        await interaction.followup.send(f"⚠️ Error al desconectar: `{e}`", ephemeral=True)
+
 
 @tree.command(name="say", description="El bot dice el texto en el canal de voz")
 @app_commands.describe(texto="Texto a decir (máx 200 caracteres recomendado)")
 async def say(interaction: discord.Interaction, texto: str):
-    # limita longitud prudente
     if len(texto) > 1000:
         await interaction.response.send_message("❌ Texto demasiado largo.", ephemeral=True)
         return
@@ -109,11 +177,10 @@ async def say(interaction: discord.Interaction, texto: str):
         await interaction.response.send_message("❌ El bot no está en ningún canal de voz. Usa /join antes.", ephemeral=True)
         return
 
-    await interaction.response.send_message("📢 Generando audio...", ephemeral=True)
+    await interaction.response.send_message("📢 Generando audio y preparándome...", ephemeral=True)
 
-    # toma lock para que no haya dos TTS a la vez
     async with tts_lock:
-        # genera archivo temporal con gTTS
+        # generar TTS
         try:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
                 tmp_path = tmp.name
@@ -122,51 +189,53 @@ async def say(interaction: discord.Interaction, texto: str):
         except Exception as e:
             logging.exception("Error al generar TTS")
             await interaction.followup.send(f"⚠️ Error al generar TTS: `{e}`", ephemeral=True)
-            # cleanup si existe
             try:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            except:
-                pass
+                if os.path.exists(tmp_path): os.remove(tmp_path)
+            except: pass
             return
 
-        # Parar reproducción actual si existe
+        # aseguramos que no esté reproduciendo; si lo está, lo paramos y esperamos
         try:
             if vc.is_playing():
                 vc.stop()
+                # small wait to let ffmpeg die
+                await asyncio.sleep(0.15)
         except Exception:
-            logging.exception("Error al detener reproducción previa")
+            logging.exception("Error al parar reproducción previa")
 
-        # Reproducir y esperar fin (sin bloquear loop)
         finished = asyncio.Event()
 
         def after_playing(err):
             if err:
                 logging.exception("Error en reproducción TTS: %s", err)
-            # señalamos que ha terminado
             try:
-                # programar en la loop principal la set() del evento
                 loop = asyncio.get_event_loop()
                 loop.call_soon_threadsafe(finished.set)
             except Exception:
                 pass
 
+        # intentamos reproducir con manejo de Already playing
         try:
             play_audio(vc, tmp_path, after=after_playing)
-        except Exception:
-            logging.exception("Error al iniciar reproducción")
-            await interaction.followup.send("⚠️ No se pudo reproducir el audio.", ephemeral=True)
+        except discord.errors.ClientException as e:
+            # Already playing o Not connected
+            logging.exception("ClientException en play_audio: %s", e)
             try:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            except:
-                pass
-            return
+                if vc.is_playing():
+                    vc.stop()
+                    await asyncio.sleep(0.15)
+                play_audio(vc, tmp_path, after=after_playing)
+            except Exception as e2:
+                logging.exception("Segundo intento de reproducir falló: %s", e2)
+                await interaction.followup.send("⚠️ No se pudo reproducir el audio.", ephemeral=True)
+                try:
+                    if os.path.exists(tmp_path): os.remove(tmp_path)
+                except: pass
+                return
 
-        # esperamos a que termine la reproducción
+        # esperar a termino
         await finished.wait()
 
-        # cleanup archivo temporal
         try:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
@@ -174,6 +243,25 @@ async def say(interaction: discord.Interaction, texto: str):
             logging.exception("No se pudo borrar tmp TTS")
 
         await interaction.followup.send("✅ He terminado de hablar.", ephemeral=True)
+
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    # Si es el bot y ha perdido la conexión, intentamos reconectar al último canal conocido
+    if member.id != bot.user.id:
+        return
+
+    guild_id = member.guild.id
+    vc = member.guild.voice_client
+
+    # Si el bot quedó sin canal (after.channel es None) => intento reconectar si tenemos registro
+    if after.channel is None:
+        logging.warning("Bot desconectado de voz en guild %s", guild_id)
+        last_chan = guild_last_voice_channel.get(guild_id)
+        if last_chan:
+            # reconectar en background (no spam)
+            bot.loop.create_task(_do_connect(guild_id, last_chan, None))
+
 
 
 # === Eventos ===
@@ -210,5 +298,21 @@ if __name__ == "__main__":
     flask_thread.daemon = True
     flask_thread.start()
 
+    # keepalive interno para que Render no duerma el servicio
+    def _keep_alive():
+        def ping():
+            while True:
+                try:
+                    requests.get("https://discord-bot-voice-cbpv.onrender.com")
+                except:
+                    pass
+                time.sleep(300)
+        t = threading.Thread(target=ping)
+        t.daemon = True
+        t.start()
+
+    _keep_alive()
+
     # arranca el bot
     bot.run(TOKEN)
+
