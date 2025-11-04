@@ -11,7 +11,6 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from flask import Flask, jsonify
-from elevenlabs import generate, set_api_key
 from elevenlabs.client import ElevenLabs
 
 # ----------------------
@@ -21,7 +20,13 @@ logging.basicConfig(level=logging.INFO)
 LOG = logging.getLogger("bot")
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-client_el = ElevenLabs(api_key=os.getenv("ELEVEN_API_KEY"))
+
+ELEVEN_API_KEY = os.getenv("ELEVEN_API_KEY")
+if not ELEVEN_API_KEY:
+    logging.warning("ELEVEN_API_KEY no encontrada en las env vars. /say fallará si se usa sin clave.")
+
+client_el = ElevenLabs(api_key=ELEVEN_API_KEY)
+
 KEEPALIVE_URL = "https://discord-bot-voice-cbpv.onrender.com"  # reemplaza si cambia
 
 # ----------------------
