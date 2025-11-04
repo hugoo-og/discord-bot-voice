@@ -1,6 +1,4 @@
 discord.py
 Flask
 requests
-TTS
-torch
-torchaudio
+elevenlabs

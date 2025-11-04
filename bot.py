@@ -11,7 +11,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from flask import Flask, jsonify
-from TTS.api import TTS
+from elevenlabs import generate, set_api_key
+from elevenlabs.client import ElevenLabs
 
 # ----------------------
 # Config + logging
@@ -20,6 +21,7 @@ logging.basicConfig(level=logging.INFO)
 LOG = logging.getLogger("bot")
 
 TOKEN = os.getenv("DISCORD_TOKEN")
+client_el = ElevenLabs(api_key=os.getenv("ELEVEN_API_KEY"))
 KEEPALIVE_URL = "https://discord-bot-voice-cbpv.onrender.com"  # reemplaza si cambia
 
 # ----------------------
@@ -202,21 +204,20 @@ async def leave(interaction: discord.Interaction):
         await interaction.followup.send("⚠️ Error al desconectar.", ephemeral=True)
 
 
-@tree.command(name="say", description="El bot dice el texto en el canal de voz (voz masculina española)")
+@tree.command(name="say", description="El bot dice el texto en el canal de voz (ElevenLabs)")
 @app_commands.describe(texto="Texto a decir (máx 300 caracteres recomendado)")
 async def say(interaction: discord.Interaction, texto: str):
-    # Usamos defer + followup para evitar "Unknown interaction" y "already acknowledged"
     await interaction.response.defer(ephemeral=True)
 
-    if not tts_model:
-        await interaction.followup.send("⚠️ TTS no cargado correctamente en el servidor.", ephemeral=True)
+    if not os.getenv("ELEVEN_API_KEY"):
+        await interaction.followup.send("⚠️ ELEVEN_API_KEY no configurada.", ephemeral=True)
         return
 
     if len(texto) > 300:
         await interaction.followup.send("❌ Texto demasiado largo (máx 300).", ephemeral=True)
         return
 
-    # Asegurar conexión de voz (si no está conectado, se une al canal del usuario)
+    # Asegurar conexión de voz (se une al canal del usuario si es necesario)
     vc = interaction.guild.voice_client
     if not vc or not vc.is_connected():
         if interaction.user.voice and interaction.user.voice.channel:
@@ -224,68 +225,77 @@ async def say(interaction: discord.Interaction, texto: str):
                 vc = await interaction.user.voice.channel.connect(reconnect=True)
                 guild_last_voice_channel[interaction.guild.id] = interaction.user.voice.channel.id
             except Exception:
-                LOG.exception("No puedo unirme al canal del usuario")
+                logging.exception("No puedo unirme al canal del usuario")
                 await interaction.followup.send("❌ No puedo unirme a tu canal.", ephemeral=True)
                 return
         else:
             await interaction.followup.send("❌ Debes estar en un canal de voz.", ephemeral=True)
             return
 
-    # Informar al usuario (followup)
+    # Intentar notificar (si la interacción expiró, seguimos igual)
     try:
-        await interaction.followup.send("🔊 Generando voz masculina...", ephemeral=True)
+        await interaction.followup.send("🔊 Generando voz (ElevenLabs)...", ephemeral=True)
     except discord.HTTPException:
-        LOG.debug("followup.send falló (posiblemente interacción expirada). Continuamos con la reproducción.")
+        logging.debug("followup.send falló (posible interacción expirada). Continuamos.")
 
-    # Generación y reproducción con lock
     async with tts_lock:
         tmp_path = None
         try:
-            # archivo temporal WAV (Coqui genera WAV)
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+            # archivo temporal .mp3
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
                 tmp_path = tmp.name
 
-            # Generar TTS (speaker=0 por defecto; puedes cambiar numeración)
-            tts_model.tts_to_file(text=texto, file_path=tmp_path, speaker=0)
-        except Exception:
-            LOG.exception("Error generando TTS")
+            # Generar audio con ElevenLabs (usa el voice_id que pediste)
+            audio = client_el.text_to_speech.convert(
+                text=texto,
+                voice_id="Nh2zY9kknu6z4pZy6FhD",
+                model_id="eleven_multilingual_v2",
+                output_format="mp3_44100_128",
+            )
+
+            # 'audio' viene como bytes — lo guardamos
+            with open(tmp_path, "wb") as f:
+                f.write(audio)
+
+        except Exception as e:
+            logging.exception("Error generando audio ElevenLabs")
+            # cleanup
             try:
                 if tmp_path and os.path.exists(tmp_path):
                     os.remove(tmp_path)
-            except Exception:
+            except:
                 pass
-            await interaction.followup.send("⚠️ Error generando la voz.", ephemeral=True)
+            await interaction.followup.send(f"⚠️ Error TTS externo: `{e}`", ephemeral=True)
             return
 
-        # Si está reproduciendo ahora, parar y esperar asíncronamente un poco
+        # Si se está reproduciendo algo, parar y dar un breve margen asíncrono
         try:
             if vc.is_playing():
                 vc.stop()
-                await asyncio.sleep(0.12)  # pequeña ventana para que FFmpeg termine procesos
+                await asyncio.sleep(0.12)
         except Exception:
-            LOG.exception("Error al detener reproducción previa (ignorado)")
+            logging.exception("Error al detener reproducción previa (ignorado)")
 
-        # Evento que se completará desde el callback thread-safe
+        # Evento para saber cuándo ha acabado la reproducción
         finished = asyncio.Event()
 
         def after_playing(error):
             if error:
-                LOG.exception("Error en after_playing: %s", error)
-            # Señalamos al loop principal de bot que ha terminado
+                logging.exception("Error en after_playing: %s", error)
             try:
                 bot.loop.call_soon_threadsafe(finished.set)
             except Exception:
-                LOG.exception("No se pudo señalizar finished desde after_playing")
+                logging.exception("No se pudo señalizar finished desde after_playing")
 
-        # Reproducir (FFmpegPCMAudio soporta WAV)
+        # Reproducir el mp3 generado
         try:
             play_audio(vc, tmp_path, after=after_playing)
         except Exception:
-            LOG.exception("Error iniciando reproducción")
+            logging.exception("Error iniciando reproducción")
             try:
                 if tmp_path and os.path.exists(tmp_path):
                     os.remove(tmp_path)
-            except Exception:
+            except:
                 pass
             await interaction.followup.send("⚠️ Error al reproducir el audio.", ephemeral=True)
             return
@@ -294,20 +304,21 @@ async def say(interaction: discord.Interaction, texto: str):
         try:
             await finished.wait()
         except Exception:
-            LOG.exception("Error esperando finished")
+            logging.exception("Error esperando finished")
 
-        # Limpieza
+        # Borrar archivo temporal
         try:
             if tmp_path and os.path.exists(tmp_path):
                 os.remove(tmp_path)
         except Exception:
-            LOG.exception("No se pudo borrar tmp TTS")
+            logging.exception("No se pudo borrar tmp TTS")
 
-        # Intentar notificar que terminó
+        # Aviso final (si aún se puede)
         try:
             await interaction.followup.send("✅ He terminado de hablar.", ephemeral=True)
         except discord.HTTPException:
-            LOG.debug("followup final falló (interacción expiró).")
+            logging.debug("No se pudo enviar followup final (interacción posiblemente expirada).")
+
 
 
 # ----------------------
