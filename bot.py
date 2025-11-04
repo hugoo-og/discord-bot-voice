@@ -247,8 +247,11 @@ async def say(interaction: discord.Interaction, texto: str):
             )
 
             # Guardar bytes en archivo temporal
-            with open(tmp_path, "wb") as f:
-                f.write(audio_bytes)
+            with open(audio_path, "wb") as f:
+                for chunk in audio_bytes:
+                    if isinstance(chunk, bytes):
+                        f.write(chunk)
+            
 
         except Exception:
             LOG.exception("Error generando audio ElevenLabs")
