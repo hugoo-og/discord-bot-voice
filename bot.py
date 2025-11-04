@@ -188,33 +188,31 @@ async def say(interaction: discord.Interaction, texto: str):
             await interaction.followup.send("❌ Debes estar en un canal de voz.", ephemeral=True)
             return
 
-    await interaction.followup.send("🔊 Generando voz masculina española...", ephemeral=True)
+    await interaction.followup.send("🔊 Generando voz masculina...", ephemeral=True)
 
     async with tts_lock:
         try:
-            # archivo temporal
             with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
                 tmp_path = tmp.name
 
-            # Generación TTS
+            # Voz masculina en español
             tts_model.tts_to_file(
                 text=texto,
                 file_path=tmp_path,
-                speaker=0  # voz masculina (puedes cambiar luego)
+                speaker=0
             )
         except Exception as e:
             logging.exception("Error TTS")
             await interaction.followup.send(f"⚠️ Error TTS: `{e}`", ephemeral=True)
             return
 
-        if vc.is_playing():
-            vc.stop()
-
         finished = asyncio.Event()
 
         def after_playing(_):
-            loop = asyncio.get_event_loop()
-            loop.call_soon_threadsafe(finished.set)
+            bot.loop.call_soon_threadsafe(finished.set)
+
+        if vc.is_playing():
+            vc.stop()
 
         try:
             play_audio(vc, tmp_path, after=after_playing)
@@ -229,6 +227,7 @@ async def say(interaction: discord.Interaction, texto: str):
             os.remove(tmp_path)
 
         await interaction.followup.send("✅ He terminado de hablar.", ephemeral=True)
+
 
 
 
