@@ -1,6 +1,6 @@
 discord.py
 Flask
 requests
-TTS==0.22.0
+TTS
 torch
 torchaudio
