@@ -168,19 +168,29 @@ async def leave(interaction: discord.Interaction):
 @tree.command(name="say", description="El bot dice el texto en el canal de voz")
 @app_commands.describe(texto="Texto a decir (máx 200 caracteres recomendado)")
 async def say(interaction: discord.Interaction, texto: str):
+    await interaction.response.defer(ephemeral=True)
+
     if len(texto) > 1000:
-        await interaction.response.send_message("❌ Texto demasiado largo.", ephemeral=True)
+        await interaction.followup.send("❌ Texto demasiado largo.", ephemeral=True)
         return
 
+    # Asegurar conexión a canal
     vc = interaction.guild.voice_client
     if not vc or not vc.is_connected():
-        await interaction.response.send_message("❌ El bot no está en ningún canal de voz. Usa /join antes.", ephemeral=True)
-        return
+        if interaction.user.voice and interaction.user.voice.channel:
+            try:
+                vc = await interaction.user.voice.channel.connect()
+            except:
+                await interaction.followup.send("❌ No puedo unirme al canal.", ephemeral=True)
+                return
+        else:
+            await interaction.followup.send("❌ No estás en un canal de voz.", ephemeral=True)
+            return
 
-    await interaction.response.send_message("📢 Generando audio y preparándome...", ephemeral=True)
+    await interaction.followup.send("📢 Generando audio...", ephemeral=True)
 
     async with tts_lock:
-        # generar TTS
+        # crear TTS temporal
         try:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
                 tmp_path = tmp.name
@@ -188,59 +198,34 @@ async def say(interaction: discord.Interaction, texto: str):
             tts.save(tmp_path)
         except Exception as e:
             logging.exception("Error al generar TTS")
-            await interaction.followup.send(f"⚠️ Error al generar TTS: `{e}`", ephemeral=True)
-            try:
-                if os.path.exists(tmp_path): os.remove(tmp_path)
-            except: pass
+            await interaction.followup.send(f"⚠️ Error TTS: `{e}`", ephemeral=True)
             return
 
-        # aseguramos que no esté reproduciendo; si lo está, lo paramos y esperamos
+        # stop previo si hay
         try:
             if vc.is_playing():
                 vc.stop()
-                # small wait to let ffmpeg die
-                await asyncio.sleep(0.15)
-        except Exception:
-            logging.exception("Error al parar reproducción previa")
+        except:
+            pass
 
         finished = asyncio.Event()
 
-        def after_playing(err):
-            if err:
-                logging.exception("Error en reproducción TTS: %s", err)
-            try:
-                loop = asyncio.get_event_loop()
-                loop.call_soon_threadsafe(finished.set)
-            except Exception:
-                pass
+        def after_playing(_):
+            loop = asyncio.get_event_loop()
+            loop.call_soon_threadsafe(finished.set)
 
-        # intentamos reproducir con manejo de Already playing
         try:
             play_audio(vc, tmp_path, after=after_playing)
-        except discord.errors.ClientException as e:
-            # Already playing o Not connected
-            logging.exception("ClientException en play_audio: %s", e)
-            try:
-                if vc.is_playing():
-                    vc.stop()
-                    await asyncio.sleep(0.15)
-                play_audio(vc, tmp_path, after=after_playing)
-            except Exception as e2:
-                logging.exception("Segundo intento de reproducir falló: %s", e2)
-                await interaction.followup.send("⚠️ No se pudo reproducir el audio.", ephemeral=True)
-                try:
-                    if os.path.exists(tmp_path): os.remove(tmp_path)
-                except: pass
-                return
+        except Exception as e:
+            logging.exception("Error al reproducir")
+            await interaction.followup.send("⚠️ Error al reproducir.", ephemeral=True)
+            return
 
-        # esperar a termino
         await finished.wait()
 
-        try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception:
-            logging.exception("No se pudo borrar tmp TTS")
+        # borrar temporal
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
         await interaction.followup.send("✅ He terminado de hablar.", ephemeral=True)
 
