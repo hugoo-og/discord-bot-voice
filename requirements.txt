@@ -1,5 +1,5 @@
 discord.py
-flask
+gTTS
+PyNaCl
+Flask
 requests
-pynacl
-gtts
