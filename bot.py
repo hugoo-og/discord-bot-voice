@@ -1,7 +1,6 @@
-# bot.py — versión corregida para ElevenLabs (sin Coqui/TTS)
+# bot.py — TTS-only behavior: join->speak->disconnect (if bot joined)
 import os
 import logging
-import threading
 import tempfile
 import asyncio
 import time
@@ -20,7 +19,6 @@ logging.basicConfig(level=logging.INFO)
 LOG = logging.getLogger("bot")
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-KEEPALIVE_URL = os.getenv("KEEPALIVE_URL", "https://discord-bot-voice-cbpv.onrender.com")
 ELEVEN_API_KEY = os.getenv("ELEVEN_API_KEY")
 VOICE_ID = "Nh2zY9kknu6z4pZy6FhD"  # tu voice id elegido
 
@@ -31,7 +29,7 @@ if not TOKEN:
 if not ELEVEN_API_KEY:
     LOG.warning("ELEVEN_API_KEY no configurada — /say fallará hasta que la pongas.")
 
-# Inicializar cliente ElevenLabs
+# Cliente ElevenLabs
 client_el = ElevenLabs(api_key=ELEVEN_API_KEY)
 
 # ----------------------
@@ -44,181 +42,123 @@ intents.guilds = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
-# guarda último canal por guild para intentar reconectar si se cae
-guild_last_voice_channel: dict[int, int] = {}
-
-# lock para evitar solapamientos de /say
+# lock para evitar solapamiento de /say
 tts_lock = asyncio.Lock()
 
 # ----------------------
-# Flask health endpoints
+# Flask health endpoints (opcional)
 # ----------------------
 app = Flask(__name__)
-
 
 @app.route("/")
 def home():
     return "Bot online", 200
 
-
 @app.route("/status")
 def status():
     return jsonify({"status": "ok", "guilds": len(bot.guilds)}), 200
 
-
 def run_flask():
-    # arrancado en hilo daemon
     app.run(host="0.0.0.0", port=8080)
 
 
 # ----------------------
-# Keepalive interno (ping a la URL cada X segundos)
+# Helpers audio
 # ----------------------
-def start_internal_keepalive(url: str, interval: int = 300):
-    import requests
-
-    def ping_loop():
-        while True:
-            try:
-                requests.get(url, timeout=5)
-            except Exception:
-                LOG.debug("Keepalive: ping fallo (ignorado).")
-            time.sleep(interval)
-
-    t = threading.Thread(target=ping_loop, name="keepalive-loop", daemon=True)
-    t.start()
-
-
-# ----------------------
-# Audio playback helper (no sleeps bloqueantes aquí)
-# ----------------------
-def play_audio(vc: discord.VoiceClient, source_path: str, after=None):
+def _after_set_event(finished_event: asyncio.Event):
     """
-    Reproduce un archivo con FFmpegPCMAudio en el VoiceClient.
+    Devuelve una función 'after' que setea finished_event (thread-safe).
     """
-    try:
-        player = discord.FFmpegPCMAudio(source_path)
-        vc.play(player, after=after)
-    except Exception:
-        LOG.exception("Error al reproducir audio.")
-        raise
-
-
-# ----------------------
-# Background connect utility
-# ----------------------
-async def _do_connect(guild_id: int, channel_id: int, notify_channel_id: Optional[int] = None):
-    """
-    Intenta conectar al canal en background y notifica al canal que solicitó la acción.
-    """
-    try:
-        guild = bot.get_guild(guild_id)
-        if not guild:
-            LOG.warning("Guild %s no encontrada.", guild_id)
-            return
-        channel = guild.get_channel(channel_id)
-        if not channel or channel.type != discord.ChannelType.voice:
-            if notify_channel_id:
-                ch = guild.get_channel(notify_channel_id)
-                if ch:
-                    await ch.send("❌ Canal de voz inválido (background).")
-            return
-
-        vc = guild.voice_client
-        if vc and vc.is_connected():
-            await vc.move_to(channel)
-            if notify_channel_id:
-                ch = guild.get_channel(notify_channel_id)
-                if ch:
-                    await ch.send(f"🔁 Movido a **{channel.name}** (background).")
-        else:
-            await channel.connect(reconnect=True)
-            guild_last_voice_channel[guild_id] = channel_id
-            if notify_channel_id:
-                ch = guild.get_channel(notify_channel_id)
-                if ch:
-                    await ch.send(f"✅ Conectado a **{channel.name}** (background).")
-    except Exception:
-        LOG.exception("Error en background connect")
+    def _after(err):
+        if err:
+            LOG.exception("Error en reproducción (after): %s", err)
         try:
-            if notify_channel_id:
-                guild = bot.get_guild(guild_id)
-                if guild:
-                    ch = guild.get_channel(notify_channel_id)
-                    if ch:
-                        await ch.send(f"⚠️ Error en conexión (background).")
+            bot.loop.call_soon_threadsafe(finished_event.set)
         except Exception:
-            pass
+            LOG.exception("No se pudo señalizar finished_event desde after.")
+    return _after
+
+
+async def play_file_and_wait(vc: discord.VoiceClient, file_path: str):
+    """
+    Reproduce file_path en vc y espera a que termine.
+    """
+    finished = asyncio.Event()
+    try:
+        player = discord.FFmpegPCMAudio(file_path)
+        vc.play(player, after=_after_set_event(finished))
+    except Exception:
+        LOG.exception("Error iniciando reproducción en play_file_and_wait")
+        raise
+    await finished.wait()
 
 
 # ----------------------
 # Slash commands
 # ----------------------
-@tree.command(name="join", description="Haz que el bot entre a un canal de voz (opcional: canal ID)")
+@tree.command(name="join", description="Conecta el bot al canal de voz (no obligatorio)")
 @app_commands.describe(channel_id="ID del canal de voz (opcional)")
-async def join(interaction: discord.Interaction, channel_id: str | None = None):
-    # Responder rápido para evitar timeout de interacción
-    await interaction.response.send_message("🔄 Intentando conectarme... (operación en background)", ephemeral=True)
-
-    # Determinar canal objetivo
-    target_channel_id = None
+async def join(interaction: discord.Interaction, channel_id: Optional[str] = None):
+    await interaction.response.send_message("🔄 Intentando conectarme...", ephemeral=True)
     try:
         if channel_id:
-            target_channel_id = int(channel_id)
+            channel = interaction.guild.get_channel(int(channel_id))
         else:
-            if interaction.user.voice and interaction.user.voice.channel:
-                target_channel_id = interaction.user.voice.channel.id
-    except Exception:
-        target_channel_id = None
+            channel = interaction.user.voice.channel if interaction.user.voice else None
 
-    if not target_channel_id:
-        await interaction.followup.send("❌ No se ha encontrado canal de voz para unirme.", ephemeral=True)
-        return
+        if not channel or channel.type != discord.ChannelType.voice:
+            await interaction.followup.send("❌ Canal de voz no válido.", ephemeral=True)
+            return
 
-    notify_channel_id = interaction.channel.id if interaction.channel else None
-    bot.loop.create_task(_do_connect(interaction.guild.id, target_channel_id, notify_channel_id))
+        vc = interaction.guild.voice_client
+        if vc and vc.is_connected():
+            await vc.move_to(channel)
+            await interaction.followup.send(f"🔁 Movido a **{channel.name}**.", ephemeral=True)
+        else:
+            await channel.connect()
+            await interaction.followup.send(f"✅ Conectado a **{channel.name}**.", ephemeral=True)
+    except Exception as e:
+        LOG.exception("Error en /join")
+        await interaction.followup.send(f"⚠️ Error al unir: `{e}`", ephemeral=True)
 
 
-@tree.command(name="leave", description="Haz que el bot salga del canal de voz")
+@tree.command(name="leave", description="Desconecta el bot del canal de voz")
 async def leave(interaction: discord.Interaction):
-    await interaction.response.send_message("🔄 Desconectando (background)...", ephemeral=True)
+    await interaction.response.send_message("🔄 Desconectando...", ephemeral=True)
     try:
         vc = interaction.guild.voice_client
         if vc and vc.is_connected():
-            async def _do_leave():
-                try:
-                    await vc.disconnect()
-                except Exception:
-                    LOG.exception("Error al desconectar background")
-
-            bot.loop.create_task(_do_leave())
-            guild_last_voice_channel.pop(interaction.guild.id, None)
-            await interaction.followup.send("👋 He pedido desconectar.", ephemeral=True)
+            await vc.disconnect()
+            await interaction.followup.send("👋 Desconectado.", ephemeral=True)
         else:
             await interaction.followup.send("❌ No estoy en ningún canal.", ephemeral=True)
-    except Exception:
+    except Exception as e:
         LOG.exception("Error en /leave")
-        await interaction.followup.send("⚠️ Error al desconectar.", ephemeral=True)
+        await interaction.followup.send(f"⚠️ Error al desconectar: `{e}`", ephemeral=True)
 
 
-@tree.command(name="say", description="El bot dice el texto en el canal de voz (ElevenLabs)")
+@tree.command(name="say", description="El bot dice el texto (entra si hace falta, habla y sale si se unió automáticamente)")
 @app_commands.describe(texto="Texto a decir (máx 300 caracteres recomendado)")
 async def say(interaction: discord.Interaction, texto: str):
-    # defer + followup pattern para evitar "Unknown interaction" y "already acknowledged"
+    # usamos defer para evitar problemas de "Unknown interaction"
     await interaction.response.defer(ephemeral=True)
 
     if len(texto) > 300:
         await interaction.followup.send("❌ Texto demasiado largo (máx 300).", ephemeral=True)
         return
 
-    # Asegurar conexión de voz (si no está conectado, se une al canal del usuario)
+    # comprobar voz y decidir si desconectar después
     vc = interaction.guild.voice_client
-    if not vc or not vc.is_connected():
+    connected_before = bool(vc and vc.is_connected())
+    should_disconnect_after = False
+
+    if not connected_before:
+        # si no hay vc, intentamos unirnos al canal del usuario
         if interaction.user.voice and interaction.user.voice.channel:
             try:
                 vc = await interaction.user.voice.channel.connect(reconnect=True)
-                guild_last_voice_channel[interaction.guild.id] = interaction.user.voice.channel.id
-            except Exception:
+                should_disconnect_after = True  # nos desconectaremos tras hablar
+            except Exception as e:
                 LOG.exception("No puedo unirme al canal del usuario")
                 await interaction.followup.send("❌ No puedo unirme a tu canal.", ephemeral=True)
                 return
@@ -226,124 +166,94 @@ async def say(interaction: discord.Interaction, texto: str):
             await interaction.followup.send("❌ Debes estar en un canal de voz.", ephemeral=True)
             return
 
-    # Notificación al usuario (si falla la notificación, no paramos la ejecución)
+    # notificar al usuario que generamos TTS
     try:
         await interaction.followup.send("🔊 Generando voz (ElevenLabs)...", ephemeral=True)
-    except discord.HTTPException:
-        LOG.debug("followup.send falló (posiblemente interacción expirada). Continuamos con la reproducción.")
+    except Exception:
+        LOG.debug("No se pudo enviar followup; seguimos de todas formas.")
 
     async with tts_lock:
-        tmp_path = None
+        audio_path = None
         try:
+            # archivo temporal
             with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
-                tmp_path = tmp.name
+                audio_path = tmp.name
 
-            # Generar audio con ElevenLabs — devuelve bytes
-            audio_bytes = client_el.text_to_speech.convert(
+            # pedir TTS (puede devolver generator)
+            audio_gen = client_el.text_to_speech.convert(
                 text=texto,
                 voice_id=VOICE_ID,
                 model_id="eleven_multilingual_v2",
                 output_format="mp3_44100_128",
             )
 
-            # Guardar bytes en archivo temporal
+            # escribir chunks si viene generator, o bytes directo
             with open(audio_path, "wb") as f:
-                for chunk in audio_bytes:
-                    if isinstance(chunk, bytes):
-                        f.write(chunk)
-            
+                if isinstance(audio_gen, (bytes, bytearray)):
+                    f.write(audio_gen)
+                else:
+                    for chunk in audio_gen:
+                        if isinstance(chunk, (bytes, bytearray)):
+                            f.write(chunk)
 
         except Exception:
             LOG.exception("Error generando audio ElevenLabs")
             try:
-                if tmp_path and os.path.exists(tmp_path):
-                    os.remove(tmp_path)
+                if audio_path and os.path.exists(audio_path):
+                    os.remove(audio_path)
             except Exception:
                 pass
             await interaction.followup.send("⚠️ Error generando la voz externa.", ephemeral=True)
+            # si nos unimos solo para esto, desconectar
+            if should_disconnect_after and vc and vc.is_connected():
+                try:
+                    await vc.disconnect()
+                except Exception:
+                    LOG.exception("No se pudo desconectar tras fallo TTS")
             return
 
-        # Si está reproduciendo algo, lo paramos y esperamos un poco (no bloqueante)
+        # reproducir y esperar a que termine
         try:
-            if vc.is_playing():
-                vc.stop()
-                await asyncio.sleep(0.12)
+            await play_file_and_wait(vc, audio_path)
         except Exception:
-            LOG.exception("Error al detener reproducción previa (ignorado)")
-
-        # Evento que se completará desde callback thread-safe
-        finished = asyncio.Event()
-
-        def after_playing(error):
-            if error:
-                LOG.exception("Error en after_playing: %s", error)
+            LOG.exception("Error reproduciendo TTS")
+            await interaction.followup.send("⚠️ Error al reproducir el audio.", ephemeral=True)
             try:
-                bot.loop.call_soon_threadsafe(finished.set)
-            except Exception:
-                LOG.exception("No se pudo señalizar finished desde after_playing")
-
-        # Reproducir
-        try:
-            play_audio(vc, tmp_path, after=after_playing)
-        except Exception:
-            LOG.exception("Error iniciando reproducción")
-            try:
-                if tmp_path and os.path.exists(tmp_path):
-                    os.remove(tmp_path)
+                if audio_path and os.path.exists(audio_path):
+                    os.remove(audio_path)
             except Exception:
                 pass
-            await interaction.followup.send("⚠️ Error al reproducir el audio.", ephemeral=True)
+            if should_disconnect_after and vc and vc.is_connected():
+                try:
+                    await vc.disconnect()
+                except Exception:
+                    LOG.exception("No se pudo desconectar tras reproducción fallida")
             return
 
-        # Esperar a que termine
+        # borrar temporal
         try:
-            await finished.wait()
-        except Exception:
-            LOG.exception("Error esperando finished")
-
-        # Cleanup
-        try:
-            if tmp_path and os.path.exists(tmp_path):
-                os.remove(tmp_path)
+            if audio_path and os.path.exists(audio_path):
+                os.remove(audio_path)
         except Exception:
             LOG.exception("No se pudo borrar tmp TTS")
 
-        # Aviso final
+    # si el bot se unió solo para hablar, desconectamos
+    if should_disconnect_after:
         try:
-            await interaction.followup.send("✅ He terminado de hablar.", ephemeral=True)
-        except discord.HTTPException:
-            LOG.debug("followup final falló (interacción posiblemente expirada).")
+            if vc and vc.is_connected():
+                await vc.disconnect()
+        except Exception:
+            LOG.exception("Error al desconectar tras /say")
+
+    # mensaje final
+    try:
+        await interaction.followup.send("✅ He terminado de hablar.", ephemeral=True)
+    except Exception:
+        LOG.debug("No se pudo enviar followup final (posible interacción expirada).")
 
 
 # ----------------------
-# Reconexion: detecta si el bot ha sido desconectado y reintenta
-# ----------------------
-@bot.event
-async def on_voice_state_update(member, before, after):
-    # Sólo nos interesa si es el bot
-    if not bot.user:
-        return
-    if member.id != bot.user.id:
-        return
-
-    guild_id = member.guild.id
-
-    # Si el bot quedó sin canal (desconexión) -> reintentar si hay último canal conocido
-    if after.channel is None:
-        LOG.warning("Bot desconectado de voz en guild %s", guild_id)
-        last_chan = guild_last_voice_channel.get(guild_id)
-        if last_chan:
-            async def _reconnect():
-                await asyncio.sleep(2)
-                try:
-                    await _do_connect(guild_id, last_chan, None)
-                except Exception:
-                    LOG.exception("Reintento de reconexión falló")
-            bot.loop.create_task(_reconnect())
-
-
-# ----------------------
-# Events
+# Events (sin reconexión automática)
 # ----------------------
 @bot.event
 async def on_ready():
@@ -356,15 +266,9 @@ async def on_ready():
 
 
 # ----------------------
-# Start everything
+# Start server + bot
 # ----------------------
 if __name__ == "__main__":
-    # Flask
     flask_thread = threading.Thread(target=run_flask, name="flask-thread", daemon=True)
     flask_thread.start()
-
-    # Keepalive interno (ping)
-    start_internal_keepalive(KEEPALIVE_URL, interval=300)
-
-    # Arrancar bot
     bot.run(TOKEN)
