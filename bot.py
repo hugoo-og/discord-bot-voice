@@ -1,4 +1,4 @@
-# bot.py
+# bot.py — versión corregida para ElevenLabs (sin Coqui/TTS)
 import os
 import logging
 import threading
@@ -20,25 +20,19 @@ logging.basicConfig(level=logging.INFO)
 LOG = logging.getLogger("bot")
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-
+KEEPALIVE_URL = os.getenv("KEEPALIVE_URL", "https://discord-bot-voice-cbpv.onrender.com")
 ELEVEN_API_KEY = os.getenv("ELEVEN_API_KEY")
+VOICE_ID = "Nh2zY9kknu6z4pZy6FhD"  # tu voice id elegido
+
+if not TOKEN:
+    LOG.error("DISCORD_TOKEN no configurado. Saliendo.")
+    raise SystemExit(1)
+
 if not ELEVEN_API_KEY:
-    logging.warning("ELEVEN_API_KEY no encontrada en las env vars. /say fallará si se usa sin clave.")
+    LOG.warning("ELEVEN_API_KEY no configurada — /say fallará hasta que la pongas.")
 
+# Inicializar cliente ElevenLabs
 client_el = ElevenLabs(api_key=ELEVEN_API_KEY)
-
-KEEPALIVE_URL = "https://discord-bot-voice-cbpv.onrender.com"  # reemplaza si cambia
-
-# ----------------------
-# TTS model (Coqui)
-# ----------------------
-# Cargar el modelo una vez al inicio. Si esto tarda, es normal (descarga/cache).
-try:
-    tts_model = TTS("tts_models/es/css10/vits")
-    LOG.info("TTS model cargado correctamente.")
-except Exception as e:
-    LOG.exception("Error cargando TTS model: %s", e)
-    tts_model = None
 
 # ----------------------
 # Discord setup
@@ -88,7 +82,6 @@ def start_internal_keepalive(url: str, interval: int = 300):
             try:
                 requests.get(url, timeout=5)
             except Exception:
-                # no queremos que falle el hilo por un fallo de red
                 LOG.debug("Keepalive: ping fallo (ignorado).")
             time.sleep(interval)
 
@@ -102,7 +95,6 @@ def start_internal_keepalive(url: str, interval: int = 300):
 def play_audio(vc: discord.VoiceClient, source_path: str, after=None):
     """
     Reproduce un archivo con FFmpegPCMAudio en el VoiceClient.
-    No hace sleeps; las esperas se gestionan en async desde la corutina.
     """
     try:
         player = discord.FFmpegPCMAudio(source_path)
@@ -212,17 +204,14 @@ async def leave(interaction: discord.Interaction):
 @tree.command(name="say", description="El bot dice el texto en el canal de voz (ElevenLabs)")
 @app_commands.describe(texto="Texto a decir (máx 300 caracteres recomendado)")
 async def say(interaction: discord.Interaction, texto: str):
+    # defer + followup pattern para evitar "Unknown interaction" y "already acknowledged"
     await interaction.response.defer(ephemeral=True)
-
-    if not os.getenv("ELEVEN_API_KEY"):
-        await interaction.followup.send("⚠️ ELEVEN_API_KEY no configurada.", ephemeral=True)
-        return
 
     if len(texto) > 300:
         await interaction.followup.send("❌ Texto demasiado largo (máx 300).", ephemeral=True)
         return
 
-    # Asegurar conexión de voz (se une al canal del usuario si es necesario)
+    # Asegurar conexión de voz (si no está conectado, se une al canal del usuario)
     vc = interaction.guild.voice_client
     if not vc or not vc.is_connected():
         if interaction.user.voice and interaction.user.voice.channel:
@@ -230,100 +219,97 @@ async def say(interaction: discord.Interaction, texto: str):
                 vc = await interaction.user.voice.channel.connect(reconnect=True)
                 guild_last_voice_channel[interaction.guild.id] = interaction.user.voice.channel.id
             except Exception:
-                logging.exception("No puedo unirme al canal del usuario")
+                LOG.exception("No puedo unirme al canal del usuario")
                 await interaction.followup.send("❌ No puedo unirme a tu canal.", ephemeral=True)
                 return
         else:
             await interaction.followup.send("❌ Debes estar en un canal de voz.", ephemeral=True)
             return
 
-    # Intentar notificar (si la interacción expiró, seguimos igual)
+    # Notificación al usuario (si falla la notificación, no paramos la ejecución)
     try:
         await interaction.followup.send("🔊 Generando voz (ElevenLabs)...", ephemeral=True)
     except discord.HTTPException:
-        logging.debug("followup.send falló (posible interacción expirada). Continuamos.")
+        LOG.debug("followup.send falló (posiblemente interacción expirada). Continuamos con la reproducción.")
 
     async with tts_lock:
         tmp_path = None
         try:
-            # archivo temporal .mp3
             with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
                 tmp_path = tmp.name
 
-            # Generar audio con ElevenLabs (usa el voice_id que pediste)
-            audio = client_el.text_to_speech.convert(
+            # Generar audio con ElevenLabs — devuelve bytes
+            audio_bytes = client_el.text_to_speech.convert(
                 text=texto,
-                voice_id="Nh2zY9kknu6z4pZy6FhD",
+                voice_id=VOICE_ID,
                 model_id="eleven_multilingual_v2",
                 output_format="mp3_44100_128",
             )
 
-            # 'audio' viene como bytes — lo guardamos
+            # Guardar bytes en archivo temporal
             with open(tmp_path, "wb") as f:
-                f.write(audio)
+                f.write(audio_bytes)
 
-        except Exception as e:
-            logging.exception("Error generando audio ElevenLabs")
-            # cleanup
+        except Exception:
+            LOG.exception("Error generando audio ElevenLabs")
             try:
                 if tmp_path and os.path.exists(tmp_path):
                     os.remove(tmp_path)
-            except:
+            except Exception:
                 pass
-            await interaction.followup.send(f"⚠️ Error TTS externo: `{e}`", ephemeral=True)
+            await interaction.followup.send("⚠️ Error generando la voz externa.", ephemeral=True)
             return
 
-        # Si se está reproduciendo algo, parar y dar un breve margen asíncrono
+        # Si está reproduciendo algo, lo paramos y esperamos un poco (no bloqueante)
         try:
             if vc.is_playing():
                 vc.stop()
                 await asyncio.sleep(0.12)
         except Exception:
-            logging.exception("Error al detener reproducción previa (ignorado)")
+            LOG.exception("Error al detener reproducción previa (ignorado)")
 
-        # Evento para saber cuándo ha acabado la reproducción
+        # Evento que se completará desde callback thread-safe
         finished = asyncio.Event()
 
         def after_playing(error):
             if error:
-                logging.exception("Error en after_playing: %s", error)
+                LOG.exception("Error en after_playing: %s", error)
             try:
                 bot.loop.call_soon_threadsafe(finished.set)
             except Exception:
-                logging.exception("No se pudo señalizar finished desde after_playing")
+                LOG.exception("No se pudo señalizar finished desde after_playing")
 
-        # Reproducir el mp3 generado
+        # Reproducir
         try:
             play_audio(vc, tmp_path, after=after_playing)
         except Exception:
-            logging.exception("Error iniciando reproducción")
+            LOG.exception("Error iniciando reproducción")
             try:
                 if tmp_path and os.path.exists(tmp_path):
                     os.remove(tmp_path)
-            except:
+            except Exception:
                 pass
             await interaction.followup.send("⚠️ Error al reproducir el audio.", ephemeral=True)
             return
 
-        # Esperar a que termine (no bloqueante)
+        # Esperar a que termine
         try:
             await finished.wait()
         except Exception:
-            logging.exception("Error esperando finished")
+            LOG.exception("Error esperando finished")
 
-        # Borrar archivo temporal
+        # Cleanup
         try:
             if tmp_path and os.path.exists(tmp_path):
                 os.remove(tmp_path)
         except Exception:
-            logging.exception("No se pudo borrar tmp TTS")
+            LOG.exception("No se pudo borrar tmp TTS")
 
-        # Aviso final (si aún se puede)
+        # Aviso final
         try:
             await interaction.followup.send("✅ He terminado de hablar.", ephemeral=True)
         except discord.HTTPException:
-            logging.debug("No se pudo enviar followup final (interacción posiblemente expirada).")
-
+            LOG.debug("followup final falló (interacción posiblemente expirada).")
 
 
 # ----------------------
@@ -344,7 +330,6 @@ async def on_voice_state_update(member, before, after):
         LOG.warning("Bot desconectado de voz en guild %s", guild_id)
         last_chan = guild_last_voice_channel.get(guild_id)
         if last_chan:
-            # lanzamos intento de reconexión con poca demora para evitar bucles inmediatos
             async def _reconnect():
                 await asyncio.sleep(2)
                 try:
@@ -379,8 +364,4 @@ if __name__ == "__main__":
     start_internal_keepalive(KEEPALIVE_URL, interval=300)
 
     # Arrancar bot
-    if not TOKEN:
-        LOG.error("DISCORD_TOKEN no configurado.")
-        raise SystemExit(1)
-
     bot.run(TOKEN)
