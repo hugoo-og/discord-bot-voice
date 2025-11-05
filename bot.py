@@ -13,6 +13,8 @@ from discord import app_commands
 from discord.ext import commands
 from flask import Flask, jsonify
 from elevenlabs.client import ElevenLabs
+from elevenlabs.core.api_error import ApiError as ElevenApiError
+import TTS
 
 # ----------------------
 # Config + logging
@@ -98,6 +100,30 @@ async def play_file_and_wait(vc: discord.VoiceClient, file_path: str):
         raise
     await finished.wait()
 
+async def ensure_vc_and_record(interaction: discord.Interaction):
+    """
+    Asegura que el bot esté en el canal de voz del usuario.
+    Devuelve (vc, error_msg) donde vc es VoiceClient o None si error.
+    También actualiza guild_last_voice_channel.
+    """
+    vc = interaction.guild.voice_client
+    if vc and vc.is_connected():
+        return vc, None
+
+    # intentar unir al canal del user
+    if interaction.user.voice and interaction.user.voice.channel:
+        try:
+            vc = await interaction.user.voice.channel.connect(reconnect=True)
+            # guardar último canal conocido
+            guild_last_voice_channel[interaction.guild.id] = interaction.user.voice.channel.id
+            return vc, None
+        except Exception as e:
+            logging.exception("No puedo unirme al canal desde ensure_vc")
+            return None, f"No puedo unirme al canal: {e}"
+    else:
+        return None, "No estás en un canal de voz."
+
+
 
 # ----------------------
 # Slash commands
@@ -128,205 +154,229 @@ async def join(interaction: discord.Interaction, channel_id: Optional[str] = Non
         await interaction.followup.send(f"⚠️ Error al unir: `{e}`", ephemeral=True)
 
 
-@tree.command(name="leave", description="Desconecta el bot del canal de voz")
+@tree.command(name="leave", description="Haz que el bot salga del canal de voz")
 async def leave(interaction: discord.Interaction):
-    await interaction.response.send_message("🔄 Desconectando...", ephemeral=True)
+    # Defer defensivo
+    try:
+        await interaction.response.send_message("🔄 Desconectando...", ephemeral=True)
+    except discord.errors.NotFound:
+        # interacción expirada: enviar por canal si posible
+        try:
+            await interaction.channel.send("🔄 Desconectando...")
+        except:
+            pass
+    except Exception:
+        logging.exception("Error al responder /leave")
+
     try:
         vc = interaction.guild.voice_client
         if vc and vc.is_connected():
-            await vc.disconnect()
-            await interaction.followup.send("👋 Desconectado.", ephemeral=True)
+            # desconecta en background
+            async def _do_leave():
+                try:
+                    await vc.disconnect()
+                except Exception:
+                    logging.exception("Error al desconectar en background")
+            bot.loop.create_task(_do_leave())
+            guild_last_voice_channel.pop(interaction.guild.id, None)
+            try:
+                await interaction.followup.send("👋 He pedido desconectar.", ephemeral=True)
+            except:
+                pass
         else:
-            await interaction.followup.send("❌ No estoy en ningún canal.", ephemeral=True)
+            try:
+                await interaction.followup.send("❌ No estoy en ningún canal.", ephemeral=True)
+            except:
+                try: await interaction.channel.send("❌ No estoy en ningún canal.")
+                except: pass
     except Exception as e:
-        LOG.exception("Error en /leave")
-        await interaction.followup.send(f"⚠️ Error al desconectar: `{e}`", ephemeral=True)
+        logging.exception("Error en /leave")
+        try:
+            await interaction.followup.send(f"⚠️ Error al desconectar: `{e}`", ephemeral=True)
+        except:
+            try: await interaction.channel.send(f"⚠️ Error al desconectar: `{e}`")
+            except: pass
 
 
 @tree.command(name="say", description="El bot dice el texto en el canal de voz")
 @app_commands.describe(texto="Texto a decir (máx 1000 caracteres recomendado)")
 async def say(interaction: discord.Interaction, texto: str):
-    # Intentamos defer pero no romper si la interacción ya expiró/ha sido respondida
-    deferred = False
+    # Defer defensivo
+    tried_defer = False
     try:
         await interaction.response.defer(ephemeral=True)
-        deferred = True
+        tried_defer = True
     except discord.errors.NotFound:
-        # interacción ya no válida -> seguiremos con followups directos si es posible
-        deferred = False
+        # interacción no válida ya; seguiremos con channel messages
+        tried_defer = False
     except Exception:
-        logging.exception("Error al hacer defer de la interacción")
-        deferred = False
+        logging.exception("Error al defer interaction")
+        tried_defer = False
 
     if len(texto) > 1000:
-        if deferred:
-            await interaction.followup.send("❌ Texto demasiado largo.", ephemeral=True)
-        else:
-            try: await interaction.channel.send("❌ Texto demasiado largo.")
-            except: pass
-        return
-
-    # Obtener VoiceClient (y unir si hace falta)
-    vc = interaction.guild.voice_client
-    if not vc or not vc.is_connected():
-        if interaction.user.voice and interaction.user.voice.channel:
-            try:
-                vc = await interaction.user.voice.channel.connect(reconnect=True)
-            except Exception as e:
-                logging.exception("No puedo unirme al canal")
-                if deferred:
-                    await interaction.followup.send("❌ No puedo unirme al canal de voz.", ephemeral=True)
-                else:
-                    try: await interaction.channel.send("❌ No puedo unirme al canal de voz.")
-                    except: pass
-                return
-        else:
-            if deferred:
-                await interaction.followup.send("❌ No estás en un canal de voz.", ephemeral=True)
-            else:
-                try: await interaction.channel.send("❌ No estás en un canal de voz.")
-                except: pass
-            return
-
-    # Aviso de generación
-    try:
-        if deferred:
-            await interaction.followup.send("📢 Generando audio...", ephemeral=True)
-        else:
-            await interaction.channel.send("📢 Generando audio...")
-    except Exception:
-        pass
-
-    # COMPROBACIÓN API KEY ElevenLabs
-    ELEVEN_API_KEY = os.getenv("ELEVEN_API_KEY")
-    if not ELEVEN_API_KEY:
-        msg = "❌ ELEVEN_API_KEY no configurada en las env vars."
-        logging.error(msg)
-        if deferred:
+        msg = "❌ Texto demasiado largo."
+        if tried_defer:
             await interaction.followup.send(msg, ephemeral=True)
         else:
             try: await interaction.channel.send(msg)
             except: pass
         return
 
-    # Generar audio por streaming y guardarlo en temporal
-    try:
-        client = ElevenLabs(api_key=ELEVEN_API_KEY)
-        audio_gen = client.text_to_speech.convert(
-            text=texto,
-            voice_id="Nh2zY9kknu6z4pZy6FhD",
-            model_id="eleven_multilingual_v2",
-            output_format="mp3_44100_128",
-        )
-    except Exception as e:
-        logging.exception("Error generando audio ElevenLabs")
-        # Si ElevenLabs devuelve ApiError con status 401, damos mensaje específico
-        try:
-            from elevenlabs.core.api_error import ApiError
-            if isinstance(e, ApiError) and getattr(e, "status_code", None) == 401:
-                msg = ("❌ ElevenLabs: Unauthorized / Free tier bloqueado. "
-                       "Comprueba tu API key o considera contratar un plan de pago "
-                       "o usar otro TTS (Coqui local).")
-                logging.error("ElevenLabs 401 - free tier blocked / unusual activity")
-                if deferred:
-                    await interaction.followup.send(msg, ephemeral=True)
-                else:
-                    try: await interaction.channel.send(msg)
-                    except: pass
-                return
-        except Exception:
-            pass
-
-        # Mensaje genérico
-        if deferred:
-            await interaction.followup.send(f"⚠️ Error ElevenLabs: {e}", ephemeral=True)
+    # Asegurar conexión
+    vc, err = await ensure_vc_and_record(interaction)
+    if not vc:
+        if tried_defer:
+            await interaction.followup.send(f"❌ {err}", ephemeral=True)
         else:
-            try: await interaction.channel.send(f"⚠️ Error ElevenLabs: {e}")
+            try: await interaction.channel.send(f"❌ {err}")
             except: pass
         return
 
-    # Guardar stream en temporal
+    # Aviso de generación
+    try:
+        if tried_defer:
+            await interaction.followup.send("📢 Generando audio...", ephemeral=True)
+        else:
+            await interaction.channel.send("📢 Generando audio...")
+    except Exception:
+        pass
+
+    # Intento ElevenLabs si hay API key
+    ELEVEN_API_KEY = os.getenv("ELEVEN_API_KEY")
     tmp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
-            tmp_path = tmp.name
-        with open(tmp_path, "wb") as f:
-            for chunk in audio_gen:
-                # chunk debería ser bytes/bytearray; si no, convertir
-                if isinstance(chunk, (bytes, bytearray)):
-                    f.write(chunk)
-                else:
-                    try:
-                        f.write(bytes(chunk))
-                    except Exception:
-                        logging.exception("Chunk no escribible, lo ignoro")
-    except Exception as e:
-        logging.exception("Error escribiendo temporal ElevenLabs")
-        if deferred:
-            await interaction.followup.send("⚠️ Error guardando audio.", ephemeral=True)
-        else:
-            try: await interaction.channel.send("⚠️ Error guardando audio.")
-            except: pass
-        if tmp_path and os.path.exists(tmp_path):
-            try: os.remove(tmp_path)
-            except: pass
-        return
 
-    # Reproducir: capturamos loop principal para notificar final desde callback
+    # Preparar loop y evento para esperar reproducción
     finished = asyncio.Event()
     loop = asyncio.get_running_loop()
 
     def after_playing(err):
         if err:
-            logging.exception("Error en reproducción TTS: %s", err)
-        # señalamos que ha terminado en la loop principal
+            logging.exception("Error en reproducción: %s", err)
         loop.call_soon_threadsafe(finished.set)
 
-    try:
-        # stop previo si existe
+    # Helper para reproducción desde fichero
+    async def play_and_wait(path: str):
         try:
-            if vc.is_playing():
-                vc.stop()
+            # parar previo
+            try:
+                if vc.is_playing():
+                    vc.stop()
+            except Exception:
+                pass
+            player = discord.FFmpegPCMAudio(path)
+            vc.play(player, after=after_playing)
+            await finished.wait()
+            return True
         except Exception:
-            pass
+            logging.exception("Error al reproducir archivo")
+            return False
 
-        # reproducir
-        player = discord.FFmpegPCMAudio(tmp_path)
-        vc.play(player, after=after_playing)
-    except Exception as e:
-        logging.exception("Error reproduciendo audio")
-        if deferred:
-            await interaction.followup.send("⚠️ Error al reproducir audio.", ephemeral=True)
-        else:
-            try: await interaction.channel.send("⚠️ Error al reproducir audio.")
-            except: pass
-        if tmp_path and os.path.exists(tmp_path):
-            try: os.remove(tmp_path)
-            except: pass
-        return
+    # 1) Intentamos ElevenLabs
+    eleven_failed = False
+    if ELEVEN_API_KEY:
+        try:
+            client = ElevenLabs(api_key=ELEVEN_API_KEY)
+            audio_gen = client.text_to_speech.convert(
+                text=texto,
+                voice_id="Nh2zY9kknu6z4pZy6FhD",
+                model_id="eleven_multilingual_v2",
+                output_format="mp3_44100_128",
+            )
+            # Guardar stream a temporal
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
+                tmp_path = tmp.name
+            with open(tmp_path, "wb") as f:
+                for chunk in audio_gen:
+                    # chunk debería ser bytes
+                    if isinstance(chunk, (bytes, bytearray)):
+                        f.write(chunk)
+                    else:
+                        try:
+                            f.write(bytes(chunk))
+                        except Exception:
+                            logging.exception("No pude convertir chunk a bytes")
+            # si llegamos aquí, tenemos tmp_path con mp3
+            ok = await play_and_wait(tmp_path)
+            if not ok:
+                if tried_defer:
+                    await interaction.followup.send("⚠️ Error al reproducir audio ElevenLabs.", ephemeral=True)
+                else:
+                    try: await interaction.channel.send("⚠️ Error al reproducir audio ElevenLabs.")
+                    except: pass
+            # limpiar archivo temporal
+            try:
+                if tmp_path and os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                logging.exception("No pude borrar tmp ElevenLabs")
+            return
+        except ElevenApiError as e:
+            # ElevenLabs API devolvió error (p. ej. 401)
+            logging.exception("ElevenLabs ApiError")
+            eleven_failed = True
+            # caemos al fallback
+        except Exception:
+            logging.exception("Error generando audio ElevenLabs")
+            eleven_failed = True
 
-    # Esperar a que termine
-    try:
-        await finished.wait()
-    except Exception:
-        pass
+    else:
+        eleven_failed = True
 
-    # Borrar temporal
-    try:
-        if tmp_path and os.path.exists(tmp_path):
-            os.remove(tmp_path)
-    except Exception:
-        logging.exception("No pude borrar tmp")
+    # 2) Fallback: Coqui TTS (local) si ElevenLabs falló
+    if eleven_failed:
+        logging.info("ElevenLabs falló; intentando fallback Coqui TTS")
+        try:
+            # import perezoso (no obligamos a tener Coqui en startup)
+            from TTS.api import TTS as CoquiTTS
+        except Exception:
+            logging.exception("Coqui TTS no disponible")
+            msg = ("❌ No pude generar la voz: ElevenLabs falló y Coqui TTS no está instalado.\n"
+                   "Soluciones: 1) Revisa tu ELEVEN_API_KEY y plan; 2) instala Coqui TTS en el entorno.")
+            if tried_defer:
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                try: await interaction.channel.send(msg)
+                except: pass
+            return
 
-    # Mensaje final
-    try:
-        if deferred:
-            await interaction.followup.send("✅ He terminado de hablar.", ephemeral=True)
-        else:
-            try: await interaction.channel.send("✅ He terminado de hablar.")
-            except: pass
-    except Exception:
-        pass
+        # Instanciar modelo (perezoso). Elige el modelo que quieras; este es un ejemplo.
+        try:
+            # Puedes cambiar el modelo por uno masculino si lo tienes: configura COQUI_MODEL env var si quieres.
+            coqui_model = os.getenv("COQUI_MODEL", "tts_models/es/css10/vits")
+            coqui = CoquiTTS(coqui_model)
+            # crear temporal y generar
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+                tmp_path = tmp.name
+            # método que guarda directo a archivo
+            coqui.tts_to_file(text=texto, file_path=tmp_path)
+            # reproducir WAV (ffmpeg lo aceptará)
+            ok = await play_and_wait(tmp_path)
+            if not ok:
+                if tried_defer:
+                    await interaction.followup.send("⚠️ Error al reproducir audio Coqui.", ephemeral=True)
+                else:
+                    try: await interaction.channel.send("⚠️ Error al reproducir audio Coqui.")
+                    except: pass
+            try:
+                if tmp_path and os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                logging.exception("No pude borrar tmp Coqui")
+            return
+        except Exception:
+            logging.exception("Error generando audio con Coqui")
+            msg = "⚠️ Error generando audio con Coqui."
+            if tried_defer:
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                try: await interaction.channel.send(msg)
+                except: pass
+            try:
+                if tmp_path and os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except:
+                pass
+            return
 
 
 # ----------------------
