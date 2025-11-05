@@ -143,119 +143,190 @@ async def leave(interaction: discord.Interaction):
         await interaction.followup.send(f"⚠️ Error al desconectar: `{e}`", ephemeral=True)
 
 
-@tree.command(name="say", description="El bot dice el texto (entra si hace falta, habla y sale si se unió automáticamente)")
-@app_commands.describe(texto="Texto a decir (máx 300 caracteres recomendado)")
+@tree.command(name="say", description="El bot dice el texto en el canal de voz")
+@app_commands.describe(texto="Texto a decir (máx 1000 caracteres recomendado)")
 async def say(interaction: discord.Interaction, texto: str):
-    # usamos defer para evitar problemas de "Unknown interaction"
-    await interaction.response.defer(ephemeral=True)
+    # Intentamos defer pero no romper si la interacción ya expiró/ha sido respondida
+    deferred = False
+    try:
+        await interaction.response.defer(ephemeral=True)
+        deferred = True
+    except discord.errors.NotFound:
+        # interacción ya no válida -> seguiremos con followups directos si es posible
+        deferred = False
+    except Exception:
+        logging.exception("Error al hacer defer de la interacción")
+        deferred = False
 
-    if len(texto) > 300:
-        await interaction.followup.send("❌ Texto demasiado largo (máx 300).", ephemeral=True)
+    if len(texto) > 1000:
+        if deferred:
+            await interaction.followup.send("❌ Texto demasiado largo.", ephemeral=True)
+        else:
+            try: await interaction.channel.send("❌ Texto demasiado largo.")
+            except: pass
         return
 
-    # comprobar voz y decidir si desconectar después
+    # Obtener VoiceClient (y unir si hace falta)
     vc = interaction.guild.voice_client
-    connected_before = bool(vc and vc.is_connected())
-    should_disconnect_after = False
-
-    if not connected_before:
-        # si no hay vc, intentamos unirnos al canal del usuario
+    if not vc or not vc.is_connected():
         if interaction.user.voice and interaction.user.voice.channel:
             try:
                 vc = await interaction.user.voice.channel.connect(reconnect=True)
-                should_disconnect_after = True  # nos desconectaremos tras hablar
             except Exception as e:
-                LOG.exception("No puedo unirme al canal del usuario")
-                await interaction.followup.send("❌ No puedo unirme a tu canal.", ephemeral=True)
+                logging.exception("No puedo unirme al canal")
+                if deferred:
+                    await interaction.followup.send("❌ No puedo unirme al canal de voz.", ephemeral=True)
+                else:
+                    try: await interaction.channel.send("❌ No puedo unirme al canal de voz.")
+                    except: pass
                 return
         else:
-            await interaction.followup.send("❌ Debes estar en un canal de voz.", ephemeral=True)
+            if deferred:
+                await interaction.followup.send("❌ No estás en un canal de voz.", ephemeral=True)
+            else:
+                try: await interaction.channel.send("❌ No estás en un canal de voz.")
+                except: pass
             return
 
-    # notificar al usuario que generamos TTS
+    # Aviso de generación
     try:
-        await interaction.followup.send("🔊 Generando voz (ElevenLabs)...", ephemeral=True)
+        if deferred:
+            await interaction.followup.send("📢 Generando audio...", ephemeral=True)
+        else:
+            await interaction.channel.send("📢 Generando audio...")
     except Exception:
-        LOG.debug("No se pudo enviar followup; seguimos de todas formas.")
+        pass
 
-    async with tts_lock:
-        audio_path = None
+    # COMPROBACIÓN API KEY ElevenLabs
+    ELEVEN_API_KEY = os.getenv("ELEVEN_API_KEY")
+    if not ELEVEN_API_KEY:
+        msg = "❌ ELEVEN_API_KEY no configurada en las env vars."
+        logging.error(msg)
+        if deferred:
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            try: await interaction.channel.send(msg)
+            except: pass
+        return
+
+    # Generar audio por streaming y guardarlo en temporal
+    try:
+        client = ElevenLabs(api_key=ELEVEN_API_KEY)
+        audio_gen = client.text_to_speech.convert(
+            text=texto,
+            voice_id="Nh2zY9kknu6z4pZy6FhD",
+            model_id="eleven_multilingual_v2",
+            output_format="mp3_44100_128",
+        )
+    except Exception as e:
+        logging.exception("Error generando audio ElevenLabs")
+        # Si ElevenLabs devuelve ApiError con status 401, damos mensaje específico
         try:
-            # archivo temporal
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
-                audio_path = tmp.name
-
-            # pedir TTS (puede devolver generator)
-            audio_gen = client_el.text_to_speech.convert(
-                text=texto,
-                voice_id=VOICE_ID,
-                model_id="eleven_multilingual_v2",
-                output_format="mp3_44100_128",
-            )
-
-            # escribir chunks si viene generator, o bytes directo
-            with open(audio_path, "wb") as f:
-                if isinstance(audio_gen, (bytes, bytearray)):
-                    f.write(audio_gen)
+            from elevenlabs.core.api_error import ApiError
+            if isinstance(e, ApiError) and getattr(e, "status_code", None) == 401:
+                msg = ("❌ ElevenLabs: Unauthorized / Free tier bloqueado. "
+                       "Comprueba tu API key o considera contratar un plan de pago "
+                       "o usar otro TTS (Coqui local).")
+                logging.error("ElevenLabs 401 - free tier blocked / unusual activity")
+                if deferred:
+                    await interaction.followup.send(msg, ephemeral=True)
                 else:
-                    for chunk in audio_gen:
-                        if isinstance(chunk, (bytes, bytearray)):
-                            f.write(chunk)
-
+                    try: await interaction.channel.send(msg)
+                    except: pass
+                return
         except Exception:
-            LOG.exception("Error generando audio ElevenLabs")
-            try:
-                if audio_path and os.path.exists(audio_path):
-                    os.remove(audio_path)
-            except Exception:
-                pass
-            await interaction.followup.send("⚠️ Error generando la voz externa.", ephemeral=True)
-            # si nos unimos solo para esto, desconectar
-            if should_disconnect_after and vc and vc.is_connected():
-                try:
-                    await vc.disconnect()
-                except Exception:
-                    LOG.exception("No se pudo desconectar tras fallo TTS")
-            return
+            pass
 
-        # reproducir y esperar a que termine
-        try:
-            await play_file_and_wait(vc, audio_path)
-        except Exception:
-            LOG.exception("Error reproduciendo TTS")
-            await interaction.followup.send("⚠️ Error al reproducir el audio.", ephemeral=True)
-            try:
-                if audio_path and os.path.exists(audio_path):
-                    os.remove(audio_path)
-            except Exception:
-                pass
-            if should_disconnect_after and vc and vc.is_connected():
-                try:
-                    await vc.disconnect()
-                except Exception:
-                    LOG.exception("No se pudo desconectar tras reproducción fallida")
-            return
+        # Mensaje genérico
+        if deferred:
+            await interaction.followup.send(f"⚠️ Error ElevenLabs: {e}", ephemeral=True)
+        else:
+            try: await interaction.channel.send(f"⚠️ Error ElevenLabs: {e}")
+            except: pass
+        return
 
-        # borrar temporal
-        try:
-            if audio_path and os.path.exists(audio_path):
-                os.remove(audio_path)
-        except Exception:
-            LOG.exception("No se pudo borrar tmp TTS")
-
-    # si el bot se unió solo para hablar, desconectamos
-    if should_disconnect_after:
-        try:
-            if vc and vc.is_connected():
-                await vc.disconnect()
-        except Exception:
-            LOG.exception("Error al desconectar tras /say")
-
-    # mensaje final
+    # Guardar stream en temporal
+    tmp_path = None
     try:
-        await interaction.followup.send("✅ He terminado de hablar.", ephemeral=True)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
+            tmp_path = tmp.name
+        with open(tmp_path, "wb") as f:
+            for chunk in audio_gen:
+                # chunk debería ser bytes/bytearray; si no, convertir
+                if isinstance(chunk, (bytes, bytearray)):
+                    f.write(chunk)
+                else:
+                    try:
+                        f.write(bytes(chunk))
+                    except Exception:
+                        logging.exception("Chunk no escribible, lo ignoro")
+    except Exception as e:
+        logging.exception("Error escribiendo temporal ElevenLabs")
+        if deferred:
+            await interaction.followup.send("⚠️ Error guardando audio.", ephemeral=True)
+        else:
+            try: await interaction.channel.send("⚠️ Error guardando audio.")
+            except: pass
+        if tmp_path and os.path.exists(tmp_path):
+            try: os.remove(tmp_path)
+            except: pass
+        return
+
+    # Reproducir: capturamos loop principal para notificar final desde callback
+    finished = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def after_playing(err):
+        if err:
+            logging.exception("Error en reproducción TTS: %s", err)
+        # señalamos que ha terminado en la loop principal
+        loop.call_soon_threadsafe(finished.set)
+
+    try:
+        # stop previo si existe
+        try:
+            if vc.is_playing():
+                vc.stop()
+        except Exception:
+            pass
+
+        # reproducir
+        player = discord.FFmpegPCMAudio(tmp_path)
+        vc.play(player, after=after_playing)
+    except Exception as e:
+        logging.exception("Error reproduciendo audio")
+        if deferred:
+            await interaction.followup.send("⚠️ Error al reproducir audio.", ephemeral=True)
+        else:
+            try: await interaction.channel.send("⚠️ Error al reproducir audio.")
+            except: pass
+        if tmp_path and os.path.exists(tmp_path):
+            try: os.remove(tmp_path)
+            except: pass
+        return
+
+    # Esperar a que termine
+    try:
+        await finished.wait()
     except Exception:
-        LOG.debug("No se pudo enviar followup final (posible interacción expirada).")
+        pass
+
+    # Borrar temporal
+    try:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+    except Exception:
+        logging.exception("No pude borrar tmp")
+
+    # Mensaje final
+    try:
+        if deferred:
+            await interaction.followup.send("✅ He terminado de hablar.", ephemeral=True)
+        else:
+            try: await interaction.channel.send("✅ He terminado de hablar.")
+            except: pass
+    except Exception:
+        pass
 
 
 # ----------------------
