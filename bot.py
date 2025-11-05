@@ -6,6 +6,7 @@ import asyncio
 import time
 from typing import Optional
 import threading
+import requests
 
 import discord
 from discord import app_commands
@@ -284,7 +285,17 @@ if __name__ == "__main__":
     time.sleep(1)
 
     LOG.info("Iniciando keepalive interno (si configurado).")
-    start_internal_keepalive(KEEPALIVE_URL, interval=300)
+    def start_internal_keepalive(url, interval=300):
+        def loop():
+            while True:
+                try:
+                    requests.get(url, timeout=10)
+                    logging.info("Keepalive interno enviado.")
+                except Exception as e:
+                    logging.error(f"Keepalive error: {e}")
+                time.sleep(interval)
+    
+        threading.Thread(target=loop, daemon=True).start()
 
     LOG.info("Arrancando bot (calling bot.run)...")
     # Lanzar python en modo sin buffer en Render (ver comando siguiente)
