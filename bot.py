@@ -128,30 +128,20 @@ async def ensure_vc_and_record(interaction: discord.Interaction):
 # ----------------------
 # Slash commands
 # ----------------------
-@tree.command(name="join", description="Conecta el bot al canal de voz (no obligatorio)")
-@app_commands.describe(channel_id="ID del canal de voz (opcional)")
-async def join(interaction: discord.Interaction, channel_id: Optional[str] = None):
-    await interaction.response.send_message("🔄 Intentando conectarme...", ephemeral=True)
+@bot.tree.command(name="join", description="El bot entra al canal de voz.")
+async def join(interaction: discord.Interaction, channel: discord.VoiceChannel):
+    await interaction.response.defer(ephemeral=False)
+
+    if interaction.guild.voice_client is not None:
+        await interaction.guild.voice_client.disconnect()
+
     try:
-        if channel_id:
-            channel = interaction.guild.get_channel(int(channel_id))
-        else:
-            channel = interaction.user.voice.channel if interaction.user.voice else None
-
-        if not channel or channel.type != discord.ChannelType.voice:
-            await interaction.followup.send("❌ Canal de voz no válido.", ephemeral=True)
-            return
-
-        vc = interaction.guild.voice_client
-        if vc and vc.is_connected():
-            await vc.move_to(channel)
-            await interaction.followup.send(f"🔁 Movido a **{channel.name}**.", ephemeral=True)
-        else:
-            await channel.connect()
-            await interaction.followup.send(f"✅ Conectado a **{channel.name}**.", ephemeral=True)
+        await channel.connect()
+        logger.info(f"Conectado al canal {channel.name}")
+        await interaction.followup.send(f"✅ Conectado a **{channel.name}**")
     except Exception as e:
-        LOG.exception("Error en /join")
-        await interaction.followup.send(f"⚠️ Error al unir: `{e}`", ephemeral=True)
+        logger.error(f"Error al conectar: {e}")
+        await interaction.followup.send(f"⚠️ Error: {e}")
 
 
 @tree.command(name="leave", description="Haz que el bot salga del canal de voz")
