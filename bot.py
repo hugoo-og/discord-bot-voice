@@ -60,7 +60,11 @@ def status():
     return jsonify({"status": "ok", "guilds": len(bot.guilds)}), 200
 
 def run_flask():
-    app.run(host="0.0.0.0", port=8080)
+    # Bind to the port Render gives us (important). Print to stdout immediately.
+    port = int(os.environ.get("PORT", os.environ.get("PORTAL_PORT", 8080)))
+    LOG.info("Starting Flask on 0.0.0.0:%s", port)
+    # app.run() es suficiente en hilo, no hace falta debug ni reloader
+    app.run(host="0.0.0.0", port=port, threaded=True)
 
 
 # ----------------------
@@ -270,6 +274,18 @@ async def on_ready():
 # Start server + bot
 # ----------------------
 if __name__ == "__main__":
+    # arrancar Flask en hilo
     flask_thread = threading.Thread(target=run_flask, name="flask-thread", daemon=True)
     flask_thread.start()
+
+    # small log to force flush
+    LOG.info("Flask thread arrancado; esperando 1s antes de iniciar bot...")
+    # permitir que Flask se vincule al puerto antes de iniciar el bot
+    time.sleep(1)
+
+    LOG.info("Iniciando keepalive interno (si configurado).")
+    start_internal_keepalive(KEEPALIVE_URL, interval=300)
+
+    LOG.info("Arrancando bot (calling bot.run)...")
+    # Lanzar python en modo sin buffer en Render (ver comando siguiente)
     bot.run(TOKEN)
