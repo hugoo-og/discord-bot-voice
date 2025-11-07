@@ -1,10 +1,9 @@
-# bot.py — TTS-only behavior: join->speak->disconnect (if bot joined)
+# bot.py — Coqui TTS (local) — join -> speak -> disconnect (si entró el bot)
 import os
 import logging
 import tempfile
 import asyncio
 import time
-from typing import Optional
 import threading
 import requests
 
@@ -12,9 +11,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from flask import Flask, jsonify
-from elevenlabs.client import ElevenLabs
-from elevenlabs.core.api_error import ApiError as ElevenApiError
-import TTS
+from TTS.api import TTS  # Coqui TTS local API
 
 # ----------------------
 # Config + logging
@@ -23,18 +20,25 @@ logging.basicConfig(level=logging.INFO)
 LOG = logging.getLogger("bot")
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-ELEVEN_API_KEY = os.getenv("ELEVEN_API_KEY")
-VOICE_ID = "Nh2zY9kknu6z4pZy6FhD"  # tu voice id elegido
+COQUI_MODEL = os.getenv("COQUI_MODEL", "tts_models/es/css10/vits")
+PORT = int(os.environ.get("PORT", 10000))
 
 if not TOKEN:
     LOG.error("DISCORD_TOKEN no configurado. Saliendo.")
     raise SystemExit(1)
 
-if not ELEVEN_API_KEY:
-    LOG.warning("ELEVEN_API_KEY no configurada — /say fallará hasta que la pongas.")
+# ----------------------
+# Globals
+# ----------------------
+# modelo Coqui (lazy)
+tts_model: TTS | None = None
+tts_model_lock = threading.Lock()
 
-# Cliente ElevenLabs
-client_el = ElevenLabs(api_key=ELEVEN_API_KEY)
+# guarda último canal por guild para re-conexiones/rejoins si quieres
+guild_last_voice_channel: dict[int, int] = {}
+
+# lock para evitar solapamiento de /say
+tts_lock = asyncio.Lock()
 
 # ----------------------
 # Discord setup
@@ -45,9 +49,6 @@ intents.guilds = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
-
-# lock para evitar solapamiento de /say
-tts_lock = asyncio.Lock()
 
 # ----------------------
 # Flask health endpoints (opcional)
@@ -63,314 +64,248 @@ def status():
     return jsonify({"status": "ok", "guilds": len(bot.guilds)}), 200
 
 def run_flask():
-    # Bind to the port Render gives us (important). Print to stdout immediately.
-    port = int(os.environ.get("PORT", os.environ.get("PORTAL_PORT", 8080)))
-    LOG.info("Starting Flask on 0.0.0.0:%s", port)
-    # app.run() es suficiente en hilo, no hace falta debug ni reloader
-    app.run(host="0.0.0.0", port=port, threaded=True)
+    LOG.info("Starting Flask on 0.0.0.0:%s", PORT)
+    app.run(host="0.0.0.0", port=PORT, threaded=True)
 
 
 # ----------------------
-# Helpers audio
+# Helpers audio / TTS
 # ----------------------
-def _after_set_event(finished_event: asyncio.Event):
+def ensure_coqui_model():
     """
-    Devuelve una función 'after' que setea finished_event (thread-safe).
+    Inicializa el modelo Coqui TTS de forma thread-safe y sin bloquear el loop principal.
+    Se puede llamar desde run_in_executor para no bloquear.
     """
-    def _after(err):
-        if err:
-            LOG.exception("Error en reproducción (after): %s", err)
-        try:
-            bot.loop.call_soon_threadsafe(finished_event.set)
-        except Exception:
-            LOG.exception("No se pudo señalizar finished_event desde after.")
-    return _after
+    global tts_model
+    if tts_model is not None:
+        return
+    with tts_model_lock:
+        if tts_model is None:
+            LOG.info("Cargando modelo Coqui: %s (esto puede tardar)", COQUI_MODEL)
+            tts_model = TTS(COQUI_MODEL)
+            LOG.info("Modelo Coqui cargado.")
+
+
+def play_audio(vc: discord.VoiceClient, source_path: str, after=None):
+    """
+    Reproduce con FFmpegPCMAudio. Si ya está reproduciendo lo para antes.
+    'after' será llamada por el hilo del player; no debe acceder al loop directamente.
+    """
+    try:
+        if vc.is_playing():
+            try:
+                vc.stop()
+            except Exception:
+                pass
+            # dejar que ffmpeg muera un momento
+            import time as _t
+            _t.sleep(0.05)
+
+        player = discord.FFmpegPCMAudio(source_path)
+        vc.play(player, after=after)
+    except Exception:
+        LOG.exception("Error al reproducir audio en play_audio")
+        raise
 
 
 async def play_file_and_wait(vc: discord.VoiceClient, file_path: str):
     """
-    Reproduce file_path en vc y espera a que termine.
+    Reproduce file_path en vc y espera a que termine (usa Event y call_soon_threadsafe).
     """
     finished = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def _after(error):
+        if error:
+            LOG.exception("Error dentro de after: %s", error)
+        loop.call_soon_threadsafe(finished.set)
+
     try:
-        player = discord.FFmpegPCMAudio(file_path)
-        vc.play(player, after=_after_set_event(finished))
+        play_audio(vc, file_path, after=_after)
     except Exception:
-        LOG.exception("Error iniciando reproducción en play_file_and_wait")
         raise
     await finished.wait()
 
-async def ensure_vc_and_record(interaction: discord.Interaction):
-    """
-    Asegura que el bot esté en el canal de voz del usuario.
-    Devuelve (vc, error_msg) donde vc es VoiceClient o None si error.
-    También actualiza guild_last_voice_channel.
-    """
-    vc = interaction.guild.voice_client
-    if vc and vc.is_connected():
-        return vc, None
 
-    # intentar unir al canal del user
-    if interaction.user.voice and interaction.user.voice.channel:
+async def safe_followup(interaction: discord.Interaction, content: str, ephemeral: bool = True):
+    """
+    Intenta enviar followup; si falla porque la interacción expiró, intenta canal.
+    """
+    try:
+        await interaction.followup.send(content, ephemeral=ephemeral)
+    except discord.NotFound:
+        # interacción desconocida/expirada
         try:
-            vc = await interaction.user.voice.channel.connect(reconnect=True)
-            # guardar último canal conocido
-            guild_last_voice_channel[interaction.guild.id] = interaction.user.voice.channel.id
-            return vc, None
-        except Exception as e:
-            logging.exception("No puedo unirme al canal desde ensure_vc")
-            return None, f"No puedo unirme al canal: {e}"
-    else:
-        return None, "No estás en un canal de voz."
-
+            if interaction.channel:
+                await interaction.channel.send(content)
+        except Exception:
+            LOG.exception("No pude enviar mensaje por canal tras fallar followup.")
+    except Exception:
+        LOG.exception("Error al enviar followup.")
 
 
 # ----------------------
 # Slash commands
 # ----------------------
-@bot.tree.command(name="join", description="El bot entra al canal de voz.")
-async def join(interaction: discord.Interaction, channel: discord.VoiceChannel):
-    await interaction.response.defer(ephemeral=False)
-
-    if interaction.guild.voice_client is not None:
-        await interaction.guild.voice_client.disconnect()
-
+@tree.command(name="join", description="El bot entra al canal de voz (mencion / seleccionado).")
+@app_commands.describe(channel="Canal de voz objetivo")
+async def join(interaction: discord.Interaction, channel: discord.VoiceChannel | None = None):
+    # Responder rápido para no caducar la interacción
     try:
-        await channel.connect()
-        logger.info(f"Conectado al canal {channel.name}")
-        await interaction.followup.send(f"✅ Conectado a **{channel.name}**")
-    except Exception as e:
-        logger.error(f"Error al conectar: {e}")
-        await interaction.followup.send(f"⚠️ Error: {e}")
-
-
-@tree.command(name="leave", description="Haz que el bot salga del canal de voz")
-async def leave(interaction: discord.Interaction):
-    # Defer defensivo
-    try:
-        await interaction.response.send_message("🔄 Desconectando...", ephemeral=True)
-    except discord.errors.NotFound:
-        # interacción expirada: enviar por canal si posible
-        try:
-            await interaction.channel.send("🔄 Desconectando...")
-        except:
-            pass
+        await interaction.response.defer(ephemeral=True)
     except Exception:
-        logging.exception("Error al responder /leave")
+        # si ya expiró, se intenta seguir adelante
+        pass
+
+    target = channel
+    if target is None:
+        if interaction.user.voice and interaction.user.voice.channel:
+            target = interaction.user.voice.channel
+        else:
+            await safe_followup(interaction, "❌ No has especificado canal y no estás en uno.", True)
+            return
 
     try:
         vc = interaction.guild.voice_client
         if vc and vc.is_connected():
-            # desconecta en background
-            async def _do_leave():
-                try:
-                    await vc.disconnect()
-                except Exception:
-                    logging.exception("Error al desconectar en background")
-            bot.loop.create_task(_do_leave())
-            guild_last_voice_channel.pop(interaction.guild.id, None)
-            try:
-                await interaction.followup.send("👋 He pedido desconectar.", ephemeral=True)
-            except:
-                pass
+            await vc.move_to(target)
         else:
-            try:
-                await interaction.followup.send("❌ No estoy en ningún canal.", ephemeral=True)
-            except:
-                try: await interaction.channel.send("❌ No estoy en ningún canal.")
-                except: pass
+            await target.connect(reconnect=True)
+        guild_last_voice_channel[interaction.guild.id] = target.id
+        await safe_followup(interaction, f"✅ Conectado a **{target.name}**", True)
     except Exception as e:
-        logging.exception("Error en /leave")
-        try:
-            await interaction.followup.send(f"⚠️ Error al desconectar: `{e}`", ephemeral=True)
-        except:
-            try: await interaction.channel.send(f"⚠️ Error al desconectar: `{e}`")
-            except: pass
+        LOG.exception("Error al conectar")
+        await safe_followup(interaction, f"⚠️ Error al conectar: `{e}`", True)
 
 
-@tree.command(name="say", description="El bot dice el texto en el canal de voz")
-@app_commands.describe(texto="Texto a decir (máx 1000 caracteres recomendado)")
-async def say(interaction: discord.Interaction, texto: str):
-    # Defer defensivo
-    tried_defer = False
+@tree.command(name="leave", description="Haz que el bot salga del canal de voz")
+async def leave(interaction: discord.Interaction):
     try:
         await interaction.response.defer(ephemeral=True)
-        tried_defer = True
-    except discord.errors.NotFound:
-        # interacción no válida ya; seguiremos con channel messages
-        tried_defer = False
-    except Exception:
-        logging.exception("Error al defer interaction")
-        tried_defer = False
-
-    if len(texto) > 1000:
-        msg = "❌ Texto demasiado largo."
-        if tried_defer:
-            await interaction.followup.send(msg, ephemeral=True)
-        else:
-            try: await interaction.channel.send(msg)
-            except: pass
-        return
-
-    # Asegurar conexión
-    vc, err = await ensure_vc_and_record(interaction)
-    if not vc:
-        if tried_defer:
-            await interaction.followup.send(f"❌ {err}", ephemeral=True)
-        else:
-            try: await interaction.channel.send(f"❌ {err}")
-            except: pass
-        return
-
-    # Aviso de generación
-    try:
-        if tried_defer:
-            await interaction.followup.send("📢 Generando audio...", ephemeral=True)
-        else:
-            await interaction.channel.send("📢 Generando audio...")
     except Exception:
         pass
 
-    # Intento ElevenLabs si hay API key
-    ELEVEN_API_KEY = os.getenv("ELEVEN_API_KEY")
-    tmp_path = None
-
-    # Preparar loop y evento para esperar reproducción
-    finished = asyncio.Event()
-    loop = asyncio.get_running_loop()
-
-    def after_playing(err):
-        if err:
-            logging.exception("Error en reproducción: %s", err)
-        loop.call_soon_threadsafe(finished.set)
-
-    # Helper para reproducción desde fichero
-    async def play_and_wait(path: str):
-        try:
-            # parar previo
+    try:
+        vc = interaction.guild.voice_client
+        if vc and vc.is_connected():
             try:
-                if vc.is_playing():
-                    vc.stop()
+                await vc.disconnect()
             except Exception:
-                pass
-            player = discord.FFmpegPCMAudio(path)
-            vc.play(player, after=after_playing)
-            await finished.wait()
-            return True
-        except Exception:
-            logging.exception("Error al reproducir archivo")
-            return False
+                LOG.exception("Error al desconectar")
+            guild_last_voice_channel.pop(interaction.guild.id, None)
+            await safe_followup(interaction, "👋 Desconectado.", True)
+        else:
+            await safe_followup(interaction, "❌ No estoy en ningún canal.", True)
+    except Exception as e:
+        LOG.exception("Error en /leave")
+        await safe_followup(interaction, f"⚠️ Error al desconectar: `{e}`", True)
 
-    # 1) Intentamos ElevenLabs
-    eleven_failed = False
-    if ELEVEN_API_KEY:
-        try:
-            client = ElevenLabs(api_key=ELEVEN_API_KEY)
-            audio_gen = client.text_to_speech.convert(
-                text=texto,
-                voice_id="Nh2zY9kknu6z4pZy6FhD",
-                model_id="eleven_multilingual_v2",
-                output_format="mp3_44100_128",
-            )
-            # Guardar stream a temporal
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
-                tmp_path = tmp.name
-            with open(tmp_path, "wb") as f:
-                for chunk in audio_gen:
-                    # chunk debería ser bytes
-                    if isinstance(chunk, (bytes, bytearray)):
-                        f.write(chunk)
-                    else:
-                        try:
-                            f.write(bytes(chunk))
-                        except Exception:
-                            logging.exception("No pude convertir chunk a bytes")
-            # si llegamos aquí, tenemos tmp_path con mp3
-            ok = await play_and_wait(tmp_path)
-            if not ok:
-                if tried_defer:
-                    await interaction.followup.send("⚠️ Error al reproducir audio ElevenLabs.", ephemeral=True)
-                else:
-                    try: await interaction.channel.send("⚠️ Error al reproducir audio ElevenLabs.")
-                    except: pass
-            # limpiar archivo temporal
+
+@tree.command(name="say", description="El bot dice el texto en el canal de voz")
+@app_commands.describe(texto="Texto a decir (máx 200 caracteres recomendado)")
+async def say(interaction: discord.Interaction, texto: str):
+    # Defer defensivo (evita Unknown interaction por tiempo de generación)
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except Exception:
+        # si ya expiró, seguimos intentando enviar followups
+        pass
+
+    if len(texto) > 1000:
+        await safe_followup(interaction, "❌ Texto demasiado largo.", True)
+        return
+
+    # Garantizar conexión al canal del usuario (si el bot ya está, usarla; sino unirse temporalmente)
+    vc = interaction.guild.voice_client
+    connected_here = False
+    if not vc or not vc.is_connected():
+        if interaction.user.voice and interaction.user.voice.channel:
             try:
-                if tmp_path and os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            except Exception:
-                logging.exception("No pude borrar tmp ElevenLabs")
-            return
-        except ElevenApiError as e:
-            # ElevenLabs API devolvió error (p. ej. 401)
-            logging.exception("ElevenLabs ApiError")
-            eleven_failed = True
-            # caemos al fallback
-        except Exception:
-            logging.exception("Error generando audio ElevenLabs")
-            eleven_failed = True
-
-    else:
-        eleven_failed = True
-
-    # 2) Fallback: Coqui TTS (local) si ElevenLabs falló
-    if eleven_failed:
-        logging.info("ElevenLabs falló; intentando fallback Coqui TTS")
-        try:
-            # import perezoso (no obligamos a tener Coqui en startup)
-            from TTS.api import TTS as CoquiTTS
-        except Exception:
-            logging.exception("Coqui TTS no disponible")
-            msg = ("❌ No pude generar la voz: ElevenLabs falló y Coqui TTS no está instalado.\n"
-                   "Soluciones: 1) Revisa tu ELEVEN_API_KEY y plan; 2) instala Coqui TTS en el entorno.")
-            if tried_defer:
-                await interaction.followup.send(msg, ephemeral=True)
-            else:
-                try: await interaction.channel.send(msg)
-                except: pass
+                vc = await interaction.user.voice.channel.connect(reconnect=True)
+                connected_here = True
+                guild_last_voice_channel[interaction.guild.id] = interaction.user.voice.channel.id
+            except Exception as e:
+                LOG.exception("No puedo unirme al canal")
+                await safe_followup(interaction, "❌ No puedo unirme al canal.", True)
+                return
+        else:
+            await safe_followup(interaction, "❌ No estás en un canal de voz.", True)
             return
 
-        # Instanciar modelo (perezoso). Elige el modelo que quieras; este es un ejemplo.
+    await safe_followup(interaction, "📢 Generando audio (Coqui TTS)...", True)
+
+    async with tts_lock:
+        tmp_path = None
         try:
-            # Puedes cambiar el modelo por uno masculino si lo tienes: configura COQUI_MODEL env var si quieres.
-            coqui_model = os.getenv("COQUI_MODEL", "tts_models/es/css10/vits")
-            coqui = CoquiTTS(coqui_model)
-            # crear temporal y generar
+            # crear temporal WAV
             with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
                 tmp_path = tmp.name
-            # método que guarda directo a archivo
-            coqui.tts_to_file(text=texto, file_path=tmp_path)
-            # reproducir WAV (ffmpeg lo aceptará)
-            ok = await play_and_wait(tmp_path)
-            if not ok:
-                if tried_defer:
-                    await interaction.followup.send("⚠️ Error al reproducir audio Coqui.", ephemeral=True)
-                else:
-                    try: await interaction.channel.send("⚠️ Error al reproducir audio Coqui.")
-                    except: pass
-            try:
-                if tmp_path and os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            except Exception:
-                logging.exception("No pude borrar tmp Coqui")
-            return
-        except Exception:
-            logging.exception("Error generando audio con Coqui")
-            msg = "⚠️ Error generando audio con Coqui."
-            if tried_defer:
-                await interaction.followup.send(msg, ephemeral=True)
-            else:
-                try: await interaction.channel.send(msg)
+
+            # cargar modelo (si hace falta) y generar en executor para no bloquear loop
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, ensure_coqui_model)
+
+            # tts_model.tts_to_file es bloqueante => ejecutarlo en executor:
+            def synth_to_file(text, path):
+                # tts_model está garantizado por ensure_coqui_model
+                global tts_model
+                tts_model.tts_to_file(text=text, file_path=path)
+
+            await loop.run_in_executor(None, synth_to_file, texto, tmp_path)
+
+        except Exception as e:
+            LOG.exception("Error al generar TTS Coqui")
+            if tmp_path and os.path.exists(tmp_path):
+                try: os.remove(tmp_path)
                 except: pass
-            try:
-                if tmp_path and os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            except:
-                pass
+            await safe_followup(interaction, f"⚠️ Error TTS: `{e}`", True)
+            # si nos conectamos sólo para esto, desconectar
+            if connected_here:
+                try:
+                    await vc.disconnect()
+                    guild_last_voice_channel.pop(interaction.guild.id, None)
+                except Exception:
+                    LOG.exception("Error al desconectar tras fallar TTS")
             return
+
+        # reproducir y esperar
+        try:
+            await play_file_and_wait(vc, tmp_path)
+        except Exception:
+            LOG.exception("Error al reproducir audio")
+            await safe_followup(interaction, "⚠️ Error al reproducir audio.", True)
+            # borrar temporal
+            if tmp_path and os.path.exists(tmp_path):
+                try: os.remove(tmp_path)
+                except: pass
+            if connected_here:
+                try:
+                    await vc.disconnect()
+                    guild_last_voice_channel.pop(interaction.guild.id, None)
+                except Exception:
+                    LOG.exception("Error al desconectar después de fallo reproducción")
+            return
+
+        # borrar temporal
+        try:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            LOG.exception("No pude borrar el temporal")
+
+        await safe_followup(interaction, "✅ He terminado de hablar.", True)
+
+        # si nos conectamos solamente para decir esto, desconectamos
+        if connected_here:
+            try:
+                await vc.disconnect()
+                guild_last_voice_channel.pop(interaction.guild.id, None)
+            except Exception:
+                LOG.exception("Error al desconectar después de hablar")
 
 
 # ----------------------
-# Events (sin reconexión automática)
+# Events
 # ----------------------
 @bot.event
 async def on_ready():
@@ -386,28 +321,28 @@ async def on_ready():
 # Start server + bot
 # ----------------------
 if __name__ == "__main__":
-    # arrancar Flask en hilo
+    # arrancar Flask en hilo (bind al puerto que dé Render)
     flask_thread = threading.Thread(target=run_flask, name="flask-thread", daemon=True)
     flask_thread.start()
 
-    # small log to force flush
     LOG.info("Flask thread arrancado; esperando 1s antes de iniciar bot...")
-    # permitir que Flask se vincule al puerto antes de iniciar el bot
     time.sleep(1)
 
-    LOG.info("Iniciando keepalive interno (si configurado).")
-    def start_internal_keepalive(url, interval=300):
-        def loop():
-            while True:
-                try:
-                    requests.get(url, timeout=10)
-                    logging.info("Keepalive interno enviado.")
-                except Exception as e:
-                    logging.error(f"Keepalive error: {e}")
-                time.sleep(interval)
-    
-        threading.Thread(target=loop, daemon=True).start()
+    # keepalive interno opcional: si defines KEEPALIVE_URL en env arrancará
+    KEEPALIVE_URL = os.getenv("KEEPALIVE_URL")
+    if KEEPALIVE_URL:
+        def start_internal_keepalive(url, interval=300):
+            def loop_ping():
+                while True:
+                    try:
+                        requests.get(url, timeout=10)
+                        LOG.info("Keepalive interno enviado.")
+                    except Exception as e:
+                        LOG.error("Keepalive error: %s", e)
+                    time.sleep(interval)
+            threading.Thread(target=loop_ping, daemon=True).start()
+        LOG.info("Iniciando keepalive interno (si configurado).")
+        start_internal_keepalive(KEEPALIVE_URL, interval=int(os.getenv("KEEPALIVE_INTERVAL", 300)))
 
     LOG.info("Arrancando bot (calling bot.run)...")
-    # Lanzar python en modo sin buffer en Render (ver comando siguiente)
     bot.run(TOKEN)

@@ -1,6 +1,5 @@
-discord.py
-Flask
-requests
-elevenlabs
-pynacl
 TTS
+discord.py==2.6.4
+Flask
+pynacl
+requests
