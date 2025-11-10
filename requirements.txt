@@ -1,5 +1,6 @@
-TTS
 discord.py==2.6.4
 Flask
 pynacl
 requests
+gTTS
+playsound==1.3.0
